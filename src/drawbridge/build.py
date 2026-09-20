@@ -13,6 +13,9 @@ from .errors import DrawbridgeError
 from .process import ExecutionResult, ExecutionSpec, SafeExecutor, TerminationReason
 
 
+_SAFE_DOCKERFILE_FRONTEND = re.compile(r"docker/dockerfile:1(?:\.[0-9]+)?(?:@sha256:[0-9a-f]{64})?")
+
+
 def _relative_path(value: str, *, allow_current: bool = False) -> Path:
     path = Path(value)
     if not value or path.is_absolute() or ".." in path.parts or (path == Path(".") and not allow_current):
@@ -138,8 +141,11 @@ async def build_images(
             dockerfile = _snapshot_path(context, target.dockerfile, directory=False)
             if dockerfile.stat().st_size > 1024 * 1024:
                 raise DrawbridgeError("BUILD_FAILED", "Dockerfile is too large")
-            if re.search(rb"(?im)^\s*#\s*syntax\s*=", dockerfile.read_bytes()):
-                raise DrawbridgeError("BUILD_FAILED", "custom Dockerfile frontends are not allowed")
+            syntax_match = re.search(rb"(?im)^\s*#\s*syntax\s*=\s*([^\s]+)", dockerfile.read_bytes())
+            if syntax_match:
+                frontend = syntax_match.group(1).decode("ascii", errors="ignore")
+                if not _SAFE_DOCKERFILE_FRONTEND.fullmatch(frontend):
+                    raise DrawbridgeError("BUILD_FAILED", "custom Dockerfile frontends are not allowed")
             tag = f"drawbridge.local/build:{release_id}-{index}"
             archive = archive_dir / f"image-{index}.tar"
             before = await executor.execute(

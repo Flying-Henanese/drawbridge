@@ -37,7 +37,8 @@ uv run drawbridge-runner --config config.local.yaml
 需要构建的服务可在 Compose 中声明 `build:`。管理员在 Gateway 和 Runner 的相同配置中
 登记 `buildkit` profile。每个构建服务只能声明与 profile 对应的 `context` 和
 `dockerfile`；不接受由 Compose 提供的 build args、secret、SSH、额外 context 或自定义
-frontend。未构建的服务继续使用 `image:`。例如：
+frontend。Dockerfile 可以声明官方 `docker/dockerfile:1.x` syntax，构建仍固定使用内置
+`dockerfile.v0`；其他 frontend 会被拒绝。未构建的服务继续使用 `image:`。例如：
 
 ```yaml
 build_profiles:

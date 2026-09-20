@@ -108,7 +108,9 @@ async def test_release_builds_each_registered_service_from_frozen_source(
     project, _ = make_project(tmp_path / "projects")
     (project / "api").mkdir()
     (project / "worker").mkdir()
-    (project / "api" / "Dockerfile").write_text("FROM scratch\nLABEL version=committed\n", encoding="utf-8")
+    (project / "api" / "Dockerfile").write_text(
+        "# syntax=docker/dockerfile:1.7\nFROM scratch\nLABEL version=committed\n", encoding="utf-8"
+    )
     (project / "worker" / "Dockerfile").write_text("FROM scratch\nLABEL role=worker\n", encoding="utf-8")
     (project / "compose.yaml").write_text(
         "services:\n"
