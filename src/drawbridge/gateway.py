@@ -8,6 +8,7 @@ from typing import Any, Literal, cast
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -69,12 +70,23 @@ class GatewayAccessMiddleware(BaseHTTPMiddleware):
 
 def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path) -> FastMCP:
     backend = service
+    # FastMCP enables localhost-only DNS rebinding protection when constructed
+    # with its default host. Keep that protection enabled, but derive the SDK's
+    # Host allowlist from the same administrator-controlled values as the
+    # gateway middleware so direct trusted-network access works without
+    # weakening the check to a wildcard.
+    transport_hosts = [f"{host}:*" for host in settings.auth.allowed_hosts]
     mcp = FastMCP(
         name="drawbridge",
         instructions=MCP_INSTRUCTIONS,
         stateless_http=True,
         streamable_http_path="/mcp",
         max_request_body_size=settings.ingress_max_body_bytes,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=transport_hosts,
+            allowed_origins=settings.auth.allowed_origins,
+        ),
     )
 
     async def ready() -> None:

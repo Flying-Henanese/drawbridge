@@ -68,3 +68,36 @@ def test_gateway_rejects_anonymous_and_exposes_catalog(tmp_path: Path) -> None:
         assert "ops_http_request" in response.text
         assert "getting_started" in response.text
         assert "ops_workflow_run" in response.text
+
+
+def test_gateway_allows_a_configured_direct_host(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "auth": {
+                    "mode": "token",
+                    "token": "gateway-test-token",
+                    "allowed_hosts": ["192.168.0.67"],
+                },
+                "allowed_client_cidrs": ["127.0.0.0/8"],
+                "allow_simulation": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with TestClient(
+        create_app(config),
+        base_url="http://192.168.0.67:8787",
+        client=("127.0.0.1", 50000),
+    ) as client:
+        response = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            headers={
+                "Authorization": "Bearer gateway-test-token",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        assert response.status_code == 200
