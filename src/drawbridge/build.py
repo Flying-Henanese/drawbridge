@@ -84,6 +84,26 @@ def _require_success(result: ExecutionResult, operation: str) -> None:
         )
 
 
+async def cleanup_image_tags(tags: list[str], executor: SafeExecutor, cwd: Path) -> None:
+    docker = shutil.which("docker")
+    if docker is None:
+        return
+    for tag in tags:
+        try:
+            await executor.execute(
+                ExecutionSpec(
+                    program=str(Path(docker).resolve()),
+                    argv=["image", "rm", tag],
+                    cwd=cwd,
+                    timeout_seconds=30,
+                    output_limit_bytes=4096,
+                    label="image-cleanup",
+                )
+            )
+        except Exception:
+            pass
+
+
 async def build_images(
     compose: ComposeSpec,
     profile: BuildProfile,
@@ -224,20 +244,7 @@ async def build_images(
         completed = True
     finally:
         if not completed:
-            for tag in loaded_tags:
-                try:
-                    await executor.execute(
-                        ExecutionSpec(
-                            program=str(Path(docker).resolve()),
-                            argv=["image", "rm", tag],
-                            cwd=release_dir,
-                            timeout_seconds=30,
-                            output_limit_bytes=4096,
-                            label="image-cleanup",
-                        )
-                    )
-                except Exception:
-                    pass
+            await cleanup_image_tags(loaded_tags, executor, release_dir)
             if archive_dir.exists():
                 shutil.rmtree(archive_dir, ignore_errors=True)
     runtime = ComposeSpec(

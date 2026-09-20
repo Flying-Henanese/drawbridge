@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 from drawbridge.config import Settings
+from drawbridge.errors import DrawbridgeError
 from drawbridge.process import ExecutionResult, ExecutionSpec, TerminationReason
 from drawbridge.service import DrawbridgeService
 from drawbridge.storage import Database
@@ -100,7 +101,7 @@ async def test_register_plan_apply_simulation_is_idempotent(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["success", "build_failed", "profile_changed"])
+@pytest.mark.parametrize("outcome", ["success", "build_failed", "profile_changed", "prepare_failed", "deploy_failed"])
 async def test_release_builds_each_registered_service_from_frozen_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
@@ -171,6 +172,8 @@ async def test_release_builds_each_registered_service_from_frozen_source(
                 assert imported
                 image_id = "sha256:" + ("a" if spec.argv[-1].endswith("-0") else "b") * 64
                 return ExecutionResult(0, TerminationReason.EXITED, 1, image_id + "\n", "", 72, 0, 72, False)
+            if spec.label == "compose-deploy" and outcome == "deploy_failed":
+                return ExecutionResult(1, TerminationReason.EXITED, 1, "", "compose failed", 0, 14, 14, False)
             return ExecutionResult(0, TerminationReason.EXITED, 1, "", "", 0, 0, 0, False)
 
         monkeypatch.setattr("drawbridge.service.shutil.which", lambda name: f"/usr/bin/{name}")
@@ -191,6 +194,12 @@ async def test_release_builds_each_registered_service_from_frozen_source(
         applied = await service.release_apply(plan_id=planned["data"]["plan_id"], idempotency_key="apply-build-001")
         if outcome == "profile_changed":
             settings.build_profiles["default"].platform = "linux/arm64"
+        if outcome == "prepare_failed":
+
+            def fail_runtime_compose(*args: object) -> None:
+                raise DrawbridgeError("DEPLOY_FAILED", "runtime compose preparation failed")
+
+            monkeypatch.setattr("drawbridge.service.write_trusted_compose", fail_runtime_compose)
         await service.run_one_job()
         status = await service.release_status(applied["data"]["job_id"])
         if outcome == "profile_changed":
@@ -204,6 +213,23 @@ async def test_release_builds_each_registered_service_from_frozen_source(
             assert await database.get_current_release("demo", "staging") is None
             assert not any(item.label == "compose-deploy" for item in seen)
             assert any(item.label == "image-cleanup" for item in seen)
+            return
+        if outcome == "prepare_failed":
+            assert status["data"]["status"] == "failed"
+            assert status["data"]["error_code"] == "DEPLOY_FAILED"
+            assert len([item for item in seen if item.label == "image-cleanup"]) == 2
+            assert not any(item.label == "compose-deploy" for item in seen)
+            release_root = tmp_path / "releases" / "demo" / "staging"
+            assert not list(release_root.iterdir())
+            return
+        if outcome == "deploy_failed":
+            assert status["data"]["status"] == "failed"
+            assert status["data"]["error_code"] == "DEPLOY_FAILED"
+            assert "release artifacts retained at" in status["data"]["message"]
+            assert not any(item.label == "image-cleanup" for item in seen)
+            release_dirs = list((tmp_path / "releases" / "demo" / "staging").iterdir())
+            assert len(release_dirs) == 1
+            assert list(release_dirs[0].glob(".drawbridge-images-*/*.tar"))
             return
         assert status["data"]["status"] == "succeeded"
         current = await database.get_current_release("demo", "staging")

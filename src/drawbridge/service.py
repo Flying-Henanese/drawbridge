@@ -15,7 +15,7 @@ from typing import Any
 
 import yaml
 
-from .build import build_images, validate_build_declarations
+from .build import build_images, cleanup_image_tags, validate_build_declarations
 from .compose import (
     ComposeError,
     ComposeSpec,
@@ -898,9 +898,16 @@ class DrawbridgeService:
                 }
             else:
                 release_payload = await self._deploy_docker(plan, binding, release_id, release_dir, snapshot["compose"])
-        except Exception:
-            if release_dir.exists():
+        except Exception as exc:
+            runtime_marker = release_dir / f".drawbridge-runtime-started-{release_id}"
+            if release_dir.exists() and not runtime_marker.exists():
                 shutil.rmtree(release_dir)
+            if runtime_marker.exists() and isinstance(exc, DrawbridgeError):
+                raise DrawbridgeError(
+                    exc.code,
+                    f"{exc.message}; release artifacts retained at {release_dir}",
+                    retryable=exc.retryable,
+                ) from exc
             raise
         await self.database.save_release(
             release_id=release_id,
@@ -973,60 +980,67 @@ class DrawbridgeService:
             if profile is None or plan.get("build_profile_digest") != self._digest(profile.model_dump()):
                 raise DrawbridgeError("STALE_PLAN", "build profile changed after plan creation")
             compose, built_images = await build_images(compose, profile, release_dir, release_id, self.executor)
-        runtime_compose = release_dir / f".drawbridge-runtime-{release_id}.yaml"
-        if runtime_compose.exists():
-            raise DrawbridgeError("DEPLOY_FAILED", "runtime compose path already exists in source snapshot")
-        compose_path = write_trusted_compose(compose, runtime_compose)
-        empty_env = Path(self.settings.resolved_state_dir(self.base_dir)) / "empty.env"
-        empty_env.parent.mkdir(parents=True, exist_ok=True)
-        empty_env.touch(exist_ok=True)
-        docker = shutil.which("docker")
-        if docker is None:
-            raise DrawbridgeError("RUNTIME_UNAVAILABLE", "docker executable is not available")
-        result = await self.executor.execute(
-            ExecutionSpec(
-                program=str(Path(docker).resolve()),
-                argv=[
-                    "compose",
-                    "--ansi",
-                    "never",
-                    "--project-name",
-                    binding["project_name"],
-                    "--project-directory",
-                    str(release_dir),
-                    "--env-file",
-                    str(empty_env),
-                    "-f",
-                    str(compose_path),
-                    "up",
-                    "--detach",
-                    "--no-build",
-                    "--pull",
-                    "never",
-                    "--wait",
-                    "--wait-timeout",
-                    "90",
-                ],
-                cwd=release_dir,
-                timeout_seconds=120,
-                output_limit_bytes=20 * 1024 * 1024,
-                label="compose-deploy",
+        runtime_marker = release_dir / f".drawbridge-runtime-started-{release_id}"
+        try:
+            runtime_compose = release_dir / f".drawbridge-runtime-{release_id}.yaml"
+            if runtime_compose.exists() or runtime_marker.exists():
+                raise DrawbridgeError("DEPLOY_FAILED", "runtime artifact path already exists in source snapshot")
+            compose_path = write_trusted_compose(compose, runtime_compose)
+            empty_env = Path(self.settings.resolved_state_dir(self.base_dir)) / "empty.env"
+            empty_env.parent.mkdir(parents=True, exist_ok=True)
+            empty_env.touch(exist_ok=True)
+            docker = shutil.which("docker")
+            if docker is None:
+                raise DrawbridgeError("RUNTIME_UNAVAILABLE", "docker executable is not available")
+            runtime_marker.write_text("compose up started\n", encoding="utf-8")
+            result = await self.executor.execute(
+                ExecutionSpec(
+                    program=str(Path(docker).resolve()),
+                    argv=[
+                        "compose",
+                        "--ansi",
+                        "never",
+                        "--project-name",
+                        binding["project_name"],
+                        "--project-directory",
+                        str(release_dir),
+                        "--env-file",
+                        str(empty_env),
+                        "-f",
+                        str(compose_path),
+                        "up",
+                        "--detach",
+                        "--no-build",
+                        "--pull",
+                        "never",
+                        "--wait",
+                        "--wait-timeout",
+                        "90",
+                    ],
+                    cwd=release_dir,
+                    timeout_seconds=120,
+                    output_limit_bytes=20 * 1024 * 1024,
+                    label="compose-deploy",
+                )
             )
-        )
-        if result.exit_code != 0:
-            raise DrawbridgeError("DEPLOY_FAILED", self._redact(result.stderr or result.stdout)[-1024:])
-        health = await self._health_check(binding, release_dir, compose_path)
-        return {
-            "source_sha": plan["commit_sha"],
-            "services": list(compose.services),
-            "mode": "docker",
-            "release_dir": str(release_dir),
-            "compose_file": str(compose_path),
-            "project_name": binding["project_name"],
-            "image_services": compose.image_services,
-            "built_images": built_images,
-            "health": health,
-        }
+            if result.exit_code != 0:
+                raise DrawbridgeError("DEPLOY_FAILED", self._redact(result.stderr or result.stdout)[-1024:])
+            health = await self._health_check(binding, release_dir, compose_path)
+            return {
+                "source_sha": plan["commit_sha"],
+                "services": list(compose.services),
+                "mode": "docker",
+                "release_dir": str(release_dir),
+                "compose_file": str(compose_path),
+                "project_name": binding["project_name"],
+                "image_services": compose.image_services,
+                "built_images": built_images,
+                "health": health,
+            }
+        except Exception:
+            if not runtime_marker.exists() and built_images:
+                await cleanup_image_tags([value["tag"] for value in built_images.values()], self.executor, release_dir)
+            raise
 
     async def _execute_rollback(self, job: JobRecord) -> dict[str, Any]:
         target = await self.database.get_release(job.payload["target_release_id"])

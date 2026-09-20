@@ -63,6 +63,10 @@ rootless BuildKit 时回退到 `docker build`。安装方式和 rootless 限制�
 发布任务从固定 Git SHA 生成快照，依次对登记服务运行 `buildctl`、导出 Docker archive、
 `docker image load`、按唯一 tag 查验镜像 ID，再生成只引用镜像 ID 的运行时 Compose 文件。
 构建产物和 SHA-256 摘要保存在 release 目录。构建失败时不会执行 Compose 更新。
+如果构建完成后、Compose 更新开始前出错，Runner 会尝试移除新导入的镜像 tag 并删除
+未完成的 release 目录。Compose 更新已开始却失败时，容器可能已有部分变化；Runner 会在
+作业错误中给出保留的 release 目录，供管理员检查运行时 Compose、构建 archive 和容器状态。
+此时不会自动回滚，管理员应在检查后决定恢复动作。
 `self-check` 会确认 `buildctl` 和 socket 存在，但无法证明 daemon 的隔离配置或镜像可运行；
 在真实服务器上需用非敏感测试应用验收完整的 `register → plan → apply → status` 流程。
 Compose 中的 `privileged`、`network_mode: host` 和任意 `devices` 仍会被注册校验拒绝；
