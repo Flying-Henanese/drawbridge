@@ -14,6 +14,21 @@ Drawbridge 是用于部署和运行观测的 MCP 服务。它由两个 Python �
 - 已完成的 t4 验证是 simulation 验证；真实 Docker 部署尚未在该记录中验收。
   参见 [docs/VERIFICATION_RECORD.md](docs/VERIFICATION_RECORD.md)。
 
+## 本地验证
+
+在仓库根目录运行：
+
+```sh
+uv sync --frozen --extra dev
+.venv/bin/python scripts/verify.py
+```
+
+脚本会在系统临时目录生成一次性的 Git/Compose 验证输入，执行静态检查、测试、自检和
+simulation 全流程；不需要仓库内的示例业务应用，也不会拉取镜像或启动容器。它会输出
+`var/verification/<UTC 时间>/report.json` 路径；请检查其中的 `result`，失败时再看同目录
+的步骤日志。验证范围和真实服务器验收的区别见 [.harness/README.md](.harness/README.md)
+与 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
+
 ## 1. 准备服务器
 
 服务器需要 Linux、systemd、Python 3.12+、Git 和 `uv`。若要运行真实业务容器，
@@ -120,7 +135,13 @@ cd /opt/drawbridge
 
 1. Gateway 的 `ExecStart` 指向 `gateway.yaml`。推荐把 `--host 0.0.0.0` 改为
    `--host 127.0.0.1`，通过 SSH 端口转发访问；模板默认监听所有网卡，不能原样用于
-   公网。当前 MCP transport 还有独立的 Host 校验，直接使用远端域名可能返回 `421`。
+   公网。当前 MCP transport 还有独立的 Host 校验，直接使用未加入白名单的远端域名
+   可能返回 `403` 或 `421`。
+   如果客户端与服务器位于同一受信任内网并且可以直连，也可以让 Gateway 监听服务器
+   内网 IP（或保留 `0.0.0.0`），但必须在防火墙中只放行可信客户端，并同步把客户端
+   地址加入 `allowed_client_cidrs`、把客户端实际使用的服务器 IP/域名加入
+   `auth.allowed_hosts`。不要因为可以直连就把 `8787` 暴露到公网；跨不可信网络时应使用
+   HTTPS 反向代理或 VPN。
 2. Runner 的 `User=` 改为业务仓库属主，`ExecStart` 指向 `runner.yaml`；只给 Runner
    所需的 Docker 权限。按上节补齐两个服务的共享状态目录权限、`UMask` 和 Runner 的
    `ReadWritePaths`。
@@ -148,7 +169,9 @@ sudo journalctl -u drawbridge-gateway.service -u drawbridge-runner.service -f
 
 ## 4. 连接 MCP 并验证
 
-采用上面的本机监听方式时，在客户端建立 SSH 端口转发：
+### 方式 A：SSH 端口转发（推荐）
+
+当 Gateway 只监听服务器 `127.0.0.1` 时，在客户端建立 SSH 端口转发：
 
 ```sh
 ssh -N -L 8787:127.0.0.1:8787 user@server.example.com
@@ -158,6 +181,34 @@ ssh -N -L 8787:127.0.0.1:8787 user@server.example.com
 `Authorization: Bearer <gateway token>`。`allowed_client_cidrs` 和
 `auth.allowed_hosts` 要允许通过转发到达的 loopback 地址及 `127.0.0.1` Host。
 Codex CLI 和 Claude Code 的具体配置见 [docs/MCP_CLIENTS.md](docs/MCP_CLIENTS.md)。
+
+### 方式 B：服务器直连（仅限受信任网络）
+
+如果客户端能够直接访问服务器，可以不建立 SSH 隧道。此时 Gateway 必须监听服务器
+内网地址，客户端把 MCP URL 改为服务器地址，例如：
+
+```text
+http://10.0.0.10:8787/mcp
+```
+
+配置示例（请替换为实际客户端地址和服务器域名；`allowed_hosts` 不包含端口）：
+
+```yaml
+allowed_client_cidrs:
+  - 10.0.0.25/32
+auth:
+  mode: token
+  token_file: /etc/drawbridge/gateway.token
+  allowed_hosts:
+    - 10.0.0.10
+    - drawbridge.internal.example.com
+```
+
+若通过域名访问，就把该域名加入 `auth.allowed_hosts`；若通过 IP 访问，就加入该 IP。
+直连 HTTP 只适合受防火墙、内网或 VPN 保护的链路；跨公网或不可信网络时，应在 Gateway
+前配置 HTTPS/TLS 反向代理，并让客户端使用 `https://.../mcp`。无论哪种接入方式，都
+必须发送 `Authorization: Bearer <gateway token>`，并先调用 `ops_catalog`。
+
 连接后先调用 `ops_catalog`；再按 `ops_app_register`（未登记时）→
 `ops_release_plan`（使用完整 Git ref，例如 `refs/heads/main`）→
 `ops_release_apply(plan_id, idempotency_key)` → `ops_release_status(job_id)` 的顺序操作。

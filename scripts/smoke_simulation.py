@@ -20,14 +20,14 @@ async def run(config_path: Path, project_dir: Path) -> dict[str, object]:
     await database.initialize()
     service = DrawbridgeService(settings, database, base_dir=base_dir)
     registered = await service.app_register(
-        app="demo",
+        app="verification",
         environment="staging",
         project_dir=str(project_dir),
         compose_file="compose.yaml",
         idempotency_key="register-smoke-001",
     )
     planned = await service.release_plan(
-        app="demo",
+        app="verification",
         environment="staging",
         source_mode="local",
         git_ref="refs/heads/main",

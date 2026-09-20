@@ -22,6 +22,11 @@ ssh -N -L 8787:127.0.0.1:8787 user@server.example.com
 | 请求头 | `Authorization: Bearer <gateway token>` |
 | 首个调用 | `ops_catalog` |
 
+上表的 URL 是 SSH 隧道方案的地址。如果客户端与服务器位于受信任内网并可直接访问，
+可以跳过 SSH 隧道，将 URL 换成 `http://<服务器内网IP>:8787/mcp` 或配置好的
+`https://<服务器域名>/mcp`；服务器端还必须按 [README.md 的直连说明](../README.md#方式-b服务器直连仅限受信任网络)
+配置 `allowed_client_cidrs`、`auth.allowed_hosts` 和防火墙。
+
 为了避免把 token 写入命令历史或配置文件，先在客户端所在机器设置环境变量：
 
 ```sh

@@ -91,6 +91,9 @@ PYTHONPATH=src .venv/bin/python scripts/smoke_simulation.py \
   --project examples/demo-repo
 ```
 
+上述命令和路径仅记录当时的 t4 操作；当前仓库不再提供 `examples/` 应用目录。
+新的本地验证入口见 `.harness/README.md`。
+
 结果：模拟部署成功。
 
 | 项目 | 结果 |
@@ -189,3 +192,32 @@ PYTHONPATH=src .venv/bin/python scripts/smoke_simulation.py \
 | 持久化与制品 | 1 plan、1 job、1 release、3 events；`release.json`、`compose.yaml`、`README.md` 存在 |
 
 本次 plan ID 为 `c2872bde-4f67-47f2-b85c-8cd76ba8f6f8`，job ID 为 `b17a4cb8-f615-4246-9128-85350a3fca7c`，release ID 为 `ebe5c7bb-348b-4c31-ac0b-d50123cabb44`。本地 Python 3.14 上有依赖库的弃用 warning；18 个测试均通过。验证目录是本机未跟踪的运行证据，不随仓库分发；其他环境可按 `AGENTS.md` 和 `.harness/README.md` 复现。
+
+## 10. 移除示例应用后的本地 harness 验证（2026-09-20）
+
+移除仓库内的 `examples/demo-app` 后，`scripts/verify.py` 改为在系统临时目录生成最小
+Git/Compose 验证仓库，并以 `verification` 应用运行 simulation。该 Compose 文件引用
+`example.invalid` 镜像；验证不拉取镜像或启动容器。运行 `uv sync --frozen --extra dev`
+和 `.venv/bin/python scripts/verify.py`，证据保存在本地忽略目录
+`var/verification/20260920T093319Z/`。
+
+本次环境为 macOS arm64、Python 3.14.5。`report.json` 的 `result` 为 `passed`：
+Ruff、格式检查、mypy、18 个 pytest 测试和编译均通过；隔离配置的 self-check
+`ok: true`；simulation job 为 `succeeded`，source SHA 与临时仓库 HEAD 一致，
+发布物 `release.json`、`compose.yaml` 存在，SQLite 中记录了 1 个 plan、1 个 job、
+1 个 release 和 3 个 event。完整命令输出见同目录的步骤日志。此结果只覆盖本地
+simulation，不能作为真实 Docker/BuildKit 部署的验收结果。
+
+## 11. BuildKit 构建流程的本地验证（2026-09-20）
+
+新增从冻结 Git 快照调用 BuildKit、导入 Docker archive、按 tag 查验镜像 ID，再以镜像 ID
+部署的流程。本机先执行 `uv sync --frozen --extra dev`，再执行
+`.venv/bin/python scripts/verify.py`；报告位于
+`var/verification/20260920T104742Z/report.json`，`result: passed`。macOS arm64、
+Python 3.14.5 环境下，Ruff、格式、mypy、编译和 25 个 pytest 测试通过；隔离
+simulation 的 self-check 和发布流程也通过。构建测试使用受控的 BuildKit/Docker 替身
+进程，覆盖两个构建服务、冻结源码、构建失败后不执行部署、Compose 启动前清理镜像、
+Compose 启动后失败保留制品、profile 变更使计划失效、现成镜像绕过构建，以及注册时
+拒绝未登记的构建参数。
+本次没有运行真实 rootless BuildKit 构建、Docker image load 或 NPU 容器；服务器安装与
+实际部署仍须按 `docs/OPERATIONS.md` 单独验收。

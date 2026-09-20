@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 import platform
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -37,11 +36,17 @@ def require(condition: bool, message: str) -> None:
 
 
 def make_fixture(root: Path, output: Path) -> tuple[Path, Path, str]:
-    project = root / "projects" / "demo"
-    shutil.copytree(ROOT / "examples" / "demo-app", project)
+    project = root / "projects" / "verification-fixture"
+    project.mkdir(parents=True)
+    (project / "compose.yaml").write_text(
+        "services:\n  app:\n    image: example.invalid/drawbridge/fixture:simulation-only\n",
+        encoding="utf-8",
+    )
     run_step("git_init", ["git", "init", "--initial-branch=main", str(project)], output)
     run_step(
-        "git_remote", ["git", "-C", str(project), "remote", "add", "origin", "https://example.invalid/demo.git"], output
+        "git_remote",
+        ["git", "-C", str(project), "remote", "add", "origin", "https://example.invalid/verification.git"],
+        output,
     )
     run_step("git_add", ["git", "-C", str(project), "add", "."], output)
     run_step(
@@ -89,8 +94,8 @@ def check_smoke(result: dict[str, Any], root: Path, sha: str) -> dict[str, Any]:
     require(job["health"] == {"status": "passed", "validation_level": "simulation"}, "simulation health failed")
     require(job["services"] == ["app"], "unexpected deployed service set")
     require(job.get("release_id"), "simulation job has no release ID")
-    release = root / "releases" / "demo" / "staging" / job["release_id"]
-    for filename in ("release.json", "compose.yaml", "README.md"):
+    release = root / "releases" / "verification" / "staging" / job["release_id"]
+    for filename in ("release.json", "compose.yaml"):
         require((release / filename).is_file(), f"missing release artifact: {filename}")
     with sqlite3.connect(root / "state" / "state.db") as db:
         counts = {
@@ -105,7 +110,7 @@ def check_smoke(result: dict[str, Any], root: Path, sha: str) -> dict[str, Any]:
         "release_id": job["release_id"],
         "job_status": job["status"],
         "database_counts": counts,
-        "artifacts": ["release.json", "compose.yaml", "README.md"],
+        "artifacts": ["release.json", "compose.yaml"],
     }
 
 

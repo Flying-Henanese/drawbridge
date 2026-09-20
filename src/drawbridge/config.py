@@ -226,7 +226,7 @@ def write_default_config(path: Path) -> None:
                 "schema_version": 1,
                 "state_dir": "./var/state",
                 "log_dir": "./var/log",
-                "allowed_project_roots": ["./examples"],
+                "allowed_project_roots": ["./var/projects"],
                 "managed_release_root": "./var/releases",
                 "managed_template_root": "./var/templates",
                 "managed_data_root": "./var/data",

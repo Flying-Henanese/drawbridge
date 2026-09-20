@@ -3,8 +3,9 @@ schema_version: 1
 # For a real server use absolute paths and auth.token_file (mode 0600).
 state_dir: ./var/state
 log_dir: ./var/log
+# Create this directory for local source checkouts, or set an absolute server path.
 allowed_project_roots:
-  - ./examples
+  - ./var/projects
 managed_release_root: ./var/releases
 managed_template_root: ./var/templates
 managed_data_root: ./var/data

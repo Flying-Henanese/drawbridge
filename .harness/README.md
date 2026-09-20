@@ -40,9 +40,10 @@ harness 成功时返回退出码 0；`--output /path/to/new-directory` 可以指
 的证据目录，默认写入 `var/verification/<UTC timestamp>/`。脚本从自身位置解析仓库根目录，
 因此可从其他当前工作目录调用。
 
-它使用 `config.example.yaml` 创建临时配置、从 `examples/demo-app` 创建临时 Git 仓库，
-并把状态、日志、发布物、模板和数据重定向到临时目录。运行不会修改已安装应用或仓库现有
-`var/` 状态；临时 fixture 会在结束时清理，证据目录中的日志和摘要会保留。
+它使用 `config.example.yaml` 创建临时配置，并在系统临时目录中生成只含最小 Compose
+文件的 Git 仓库。该文件使用不可用的 `example.invalid` 镜像，仅供 simulation 验证，
+不是可部署的业务应用。状态、日志、发布物、模板和数据也重定向到临时目录。运行不会修改
+已安装应用或仓库现有 `var/` 状态；临时仓库在结束时清理，证据目录中的日志和摘要会保留。
 
 ## 质量门和证据
 
@@ -54,7 +55,7 @@ harness 成功时返回退出码 0；`--output /path/to/new-directory` 可以指
 | pytest | 完整测试套件，包括 Gateway 匿名 `401` 和已认证 `ops_catalog` MCP 调用 | `pytest.log` |
 | 编译 | Python 源码编译 | `compileall.log` |
 | 主机自检 | 隔离 simulation 配置的阻断检查通过 | `self_check.log`、`report.json` |
-| Simulation | register → plan → apply → run job → status；检查 job、health、source SHA、发布物和 SQLite 记录 | `simulation.log`、`report.json` |
+| Simulation | 对临时 Git 仓库执行 register → plan → apply → run job → status；检查 job、health、source SHA、发布物和 SQLite 记录，不拉取镜像或启动容器 | `simulation.log`、`report.json` |
 
 `report.json` 包含结果、时间、主机/Python/Git 信息、自检明细、simulation ID 和数据库行数。
 每个步骤日志记录命令、退出码、标准输出和标准错误。失败步骤会写入 `result: failed` 并以
