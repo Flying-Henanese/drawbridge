@@ -29,6 +29,8 @@ uv run drawbridge-runner --config config.local.yaml
    systemd 用户；只有 Runner 拥有 Docker 权限。
 5. 启动 Gateway 和 Runner 后，先调用 `ops_catalog`，再按“register → plan → apply →
    status → logs/HTTP”顺序验证。`ops_release_apply` 只接受 plan ID，不接受命令或路径。
+   Codex CLI、Claude Code 等客户端的 SSH 隧道、token 环境变量和 MCP 配置见
+   [`MCP_CLIENTS.md`](MCP_CLIENTS.md)。
 
 ## t4 验证约定
 

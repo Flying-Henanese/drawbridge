@@ -188,4 +188,4 @@ PYTHONPATH=src .venv/bin/python scripts/smoke_simulation.py \
 | simulation | job `succeeded`，健康检查 `passed`，source SHA 与 fixture HEAD 相同 |
 | 持久化与制品 | 1 plan、1 job、1 release、3 events；`release.json`、`compose.yaml`、`README.md` 存在 |
 
-本次 plan ID 为 `c2872bde-4f67-47f2-b85c-8cd76ba8f6f8`，job ID 为 `b17a4cb8-f615-4246-9128-85350a3fca7c`，release ID 为 `ebe5c7bb-348b-4c31-ac0b-d50123cabb44`。本地 Python 3.14 上有依赖库的弃用 warning；18 个测试均通过。验证目录是本机未跟踪的运行证据，不随仓库分发；其他环境可按 `AGENTS.md` 和 `docs/HARNESS.md` 复现。
+本次 plan ID 为 `c2872bde-4f67-47f2-b85c-8cd76ba8f6f8`，job ID 为 `b17a4cb8-f615-4246-9128-85350a3fca7c`，release ID 为 `ebe5c7bb-348b-4c31-ac0b-d50123cabb44`。本地 Python 3.14 上有依赖库的弃用 warning；18 个测试均通过。验证目录是本机未跟踪的运行证据，不随仓库分发；其他环境可按 `AGENTS.md` 和 `.harness/README.md` 复现。
