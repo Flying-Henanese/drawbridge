@@ -134,6 +134,7 @@ async def build_images(
         raise DrawbridgeError("BUILD_FAILED", "cannot create image artifact directory") from exc
     loaded_tags: list[str] = []
     completed = False
+    dockerfile_dir: Path | None = None
     try:
         for index, name in enumerate(compose.build_services):
             target = _target(profile, name)
@@ -141,11 +142,25 @@ async def build_images(
             dockerfile = _snapshot_path(context, target.dockerfile, directory=False)
             if dockerfile.stat().st_size > 1024 * 1024:
                 raise DrawbridgeError("BUILD_FAILED", "Dockerfile is too large")
-            syntax_match = re.search(rb"(?im)^\s*#\s*syntax\s*=\s*([^\s]+)", dockerfile.read_bytes())
+            dockerfile_bytes = dockerfile.read_bytes()
+            syntax_match = re.search(rb"(?im)^\s*#\s*syntax\s*=\s*([^\s]+)", dockerfile_bytes)
+            dockerfile_for_build = dockerfile
             if syntax_match:
                 frontend = syntax_match.group(1).decode("ascii", errors="ignore")
                 if not _SAFE_DOCKERFILE_FRONTEND.fullmatch(frontend):
                     raise DrawbridgeError("BUILD_FAILED", "custom Dockerfile frontends are not allowed")
+                # The built-in dockerfile.v0 frontend otherwise follows this
+                # directive and tries to resolve docker/dockerfile from a
+                # registry. Strip only the allowlisted official directive in a
+                # temporary frontend directory so builds stay self-contained.
+                if dockerfile_dir is None:
+                    dockerfile_dir = release_dir.parent / f".{release_id}-dockerfiles"
+                    dockerfile_dir.mkdir(mode=0o700, exist_ok=False)
+                dockerfile_for_build = dockerfile_dir / f"Dockerfile-{index}"
+                dockerfile_for_build.write_bytes(
+                    re.sub(rb"(?im)^\s*#\s*syntax\s*=[^\r\n]*(?:\r?\n|$)", b"", dockerfile_bytes, count=1)
+                )
+                dockerfile_for_build.chmod(0o600)
             tag = f"drawbridge.local/build:{release_id}-{index}"
             archive = archive_dir / f"image-{index}.tar"
             before = await executor.execute(
@@ -178,9 +193,9 @@ async def build_images(
                         "--local",
                         f"context={context}",
                         "--local",
-                        f"dockerfile={dockerfile.parent}",
+                        f"dockerfile={dockerfile_for_build.parent}",
                         "--opt",
-                        f"filename={dockerfile.name}",
+                        f"filename={dockerfile_for_build.name}",
                         "--opt",
                         f"platform={profile.platform}",
                         "--output",
@@ -249,6 +264,8 @@ async def build_images(
             value["archive"] = str(retained_dir / Path(value["archive"]).name)
         completed = True
     finally:
+        if dockerfile_dir is not None:
+            shutil.rmtree(dockerfile_dir, ignore_errors=True)
         if not completed:
             await cleanup_image_tags(loaded_tags, executor, release_dir)
             if archive_dir.exists():

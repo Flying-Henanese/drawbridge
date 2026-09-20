@@ -161,8 +161,12 @@ async def test_release_builds_each_registered_service_from_frozen_source(
                 archive.write_bytes(b"docker archive fixture")
                 assert str(spec.cwd).startswith(str(tmp_path / "releases"))
                 dockerfile_arg = next(item for item in spec.argv if item.startswith("dockerfile="))
-                dockerfile = Path(dockerfile_arg.removeprefix("dockerfile=")) / "Dockerfile"
+                dockerfile_name = next(item for item in spec.argv if item.startswith("filename=")).removeprefix(
+                    "filename="
+                )
+                dockerfile = Path(dockerfile_arg.removeprefix("dockerfile=")) / dockerfile_name
                 assert "dirty" not in dockerfile.read_text(encoding="utf-8")
+                assert "syntax=" not in dockerfile.read_text(encoding="utf-8")
                 if outcome == "build_failed" and archive.name == "image-1.tar":
                     return ExecutionResult(1, TerminationReason.EXITED, 1, "", "build failed", 0, 12, 12, False)
                 return ExecutionResult(0, TerminationReason.EXITED, 1, "", "", 0, 0, 0, False)
