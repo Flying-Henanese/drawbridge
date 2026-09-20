@@ -15,6 +15,7 @@ from typing import Any
 
 import yaml
 
+from .build import build_images, validate_build_declarations
 from .compose import (
     ComposeError,
     ComposeSpec,
@@ -71,7 +72,7 @@ class DrawbridgeService:
                 "workflows": {
                     "deploy_basic": {
                         "requires_plan": True,
-                        "steps": ["snapshot", "deploy", "health", "finalize"],
+                        "steps": ["snapshot", "build", "import", "deploy", "health", "finalize"],
                     }
                 },
                 "constraints": {
@@ -133,6 +134,8 @@ class DrawbridgeService:
                 head_sha=head_sha,
                 profile=profile,
             )
+            if binding["deployment_mode"] == "docker":
+                validate_build_declarations(compose, self.settings.build_profiles[profile])
             if binding["editable_files"]:
                 revision_id = str(uuid.uuid4())
                 revision_files: dict[str, Any] = {}
@@ -360,6 +363,9 @@ class DrawbridgeService:
             service_set = list(binding["services"])
             if current is not None and sorted(current.get("services", [])) != sorted(service_set):
                 raise DrawbridgeError("UNSUPPORTED_SERVICE_CHANGE", "service topology changed from the fixed baseline")
+            profile = self.settings.build_profiles.get(binding["profile"])
+            if profile is None:
+                raise DrawbridgeError("APP_NOT_DEPLOYABLE", "registered build profile is unavailable")
             plan_id = str(uuid.uuid4())
             expires_at = time.time() + 15 * 60
             payload = {
@@ -374,6 +380,7 @@ class DrawbridgeService:
                 "compose_file": binding["compose_file"],
                 "project_name": binding["project_name"],
                 "configuration_digest": self._digest(binding),
+                "build_profile_digest": self._digest(profile.model_dump()),
             }
             await self.database.save_plan(
                 plan_id=plan_id,
@@ -960,9 +967,16 @@ class DrawbridgeService:
     async def _deploy_docker(
         self, plan: dict[str, Any], binding: dict[str, Any], release_id: str, release_dir: Path, compose: ComposeSpec
     ) -> dict[str, Any]:
+        built_images: dict[str, dict[str, Any]] = {}
         if compose.build_services:
-            raise DrawbridgeError("BUILD_UNAVAILABLE", "BuildKit build profiles are not enabled in this MVP runtime")
-        compose_path = write_trusted_compose(compose, release_dir / "compose.yaml")
+            profile = self.settings.build_profiles.get(binding["profile"])
+            if profile is None or plan.get("build_profile_digest") != self._digest(profile.model_dump()):
+                raise DrawbridgeError("STALE_PLAN", "build profile changed after plan creation")
+            compose, built_images = await build_images(compose, profile, release_dir, release_id, self.executor)
+        runtime_compose = release_dir / f".drawbridge-runtime-{release_id}.yaml"
+        if runtime_compose.exists():
+            raise DrawbridgeError("DEPLOY_FAILED", "runtime compose path already exists in source snapshot")
+        compose_path = write_trusted_compose(compose, runtime_compose)
         empty_env = Path(self.settings.resolved_state_dir(self.base_dir)) / "empty.env"
         empty_env.parent.mkdir(parents=True, exist_ok=True)
         empty_env.touch(exist_ok=True)
@@ -1010,6 +1024,7 @@ class DrawbridgeService:
             "compose_file": str(compose_path),
             "project_name": binding["project_name"],
             "image_services": compose.image_services,
+            "built_images": built_images,
             "health": health,
         }
 

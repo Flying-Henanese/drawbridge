@@ -120,13 +120,17 @@ class AppConfig(ConfigModel):
     build_profile: StrictStr = "default"
 
 
-class BuildProfile(ConfigModel):
+class BuildTarget(ConfigModel):
     context: StrictStr = "."
     dockerfile: StrictStr = "Dockerfile"
+
+
+class BuildProfile(BuildTarget):
     platform: StrictStr = "linux/amd64"
     timeout_seconds: StrictInt = Field(default=900, ge=1, le=3600)
     buildkit_socket: StrictStr | None = None
     mode: Literal["buildkit", "simulation", "prebuilt"] = "buildkit"
+    targets: dict[str, BuildTarget] = Field(default_factory=dict)
 
 
 class Settings(ConfigModel):

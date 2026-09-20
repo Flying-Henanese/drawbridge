@@ -61,14 +61,26 @@ def run_self_check(settings: Settings, *, base_dir: Path) -> dict[str, Any]:
         add("http_egress_policy", True, f"{len(settings.http_verify.allowed_cidrs)} CIDR(s)")
     else:
         add("http_egress_policy", False, "no outbound CIDR is configured", blocking=False)
-    buildkit = any(profile.mode == "buildkit" for profile in settings.build_profiles.values())
+    buildkit_profiles = [profile for profile in settings.build_profiles.values() if profile.mode == "buildkit"]
     buildctl = shutil.which("buildctl")
     add(
         "rootless_buildkit",
-        not buildkit or buildctl is not None,
+        not buildkit_profiles or buildctl is not None,
         buildctl or "not configured",
-        blocking=buildkit,
+        blocking=bool(buildkit_profiles),
     )
+    for name, profile in settings.build_profiles.items():
+        if profile.mode != "buildkit":
+            continue
+        address = profile.buildkit_socket or ""
+        socket = Path(address.removeprefix("unix://")) if address.startswith("unix:///") else None
+        ready = socket is not None and socket.is_socket() and not socket.is_symlink()
+        add(
+            f"buildkit_socket_{name}",
+            ready,
+            str(socket) if socket is not None else "local Unix socket is not configured",
+            blocking=True,
+        )
     return {
         "ok": all(check["ok"] for check in checks if check["blocking"]),
         "checks": checks,

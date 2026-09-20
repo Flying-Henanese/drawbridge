@@ -4,8 +4,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from drawbridge.config import Settings
+from drawbridge.process import ExecutionResult, ExecutionSpec, TerminationReason
 from drawbridge.service import DrawbridgeService
 from drawbridge.storage import Database
 
@@ -95,6 +97,204 @@ async def test_register_plan_apply_simulation_is_idempotent(tmp_path: Path) -> N
     assert current["source_sha"] == sha
     assert "services:" in Path(current["compose_file"]).read_text(encoding="utf-8")
     await database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "build_failed", "profile_changed"])
+async def test_release_builds_each_registered_service_from_frozen_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    (project / "api").mkdir()
+    (project / "worker").mkdir()
+    (project / "api" / "Dockerfile").write_text("FROM scratch\nLABEL version=committed\n", encoding="utf-8")
+    (project / "worker" / "Dockerfile").write_text("FROM scratch\nLABEL role=worker\n", encoding="utf-8")
+    (project / "compose.yaml").write_text(
+        "services:\n"
+        "  api:\n"
+        "    build: {context: ./api, dockerfile: Dockerfile}\n"
+        "  worker:\n"
+        "    build: {context: ./worker, dockerfile: Dockerfile}\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "build services"], cwd=project, check=True, capture_output=True)
+    socket_path = tmp_path / "buildkit.sock"
+    socket_path.touch()
+    real_is_socket = Path.is_socket
+    monkeypatch.setattr(Path, "is_socket", lambda path: path == socket_path or real_is_socket(path))
+    database: Database | None = None
+    try:
+        settings = Settings(
+            state_dir=str(tmp_path / "state"),
+            allowed_project_roots=[str(tmp_path / "projects")],
+            managed_release_root=str(tmp_path / "releases"),
+            managed_template_root=str(tmp_path / "templates"),
+            managed_data_root=str(tmp_path / "data"),
+            auth={"mode": "token", "token": "local-test-token"},
+            build_profiles={
+                "default": {
+                    "mode": "buildkit",
+                    "buildkit_socket": f"unix://{socket_path}",
+                    "targets": {
+                        "api": {"context": "api"},
+                        "worker": {"context": "worker"},
+                    },
+                }
+            },
+        )
+        database = Database(tmp_path / "state" / "state.db")
+        await database.initialize()
+        service = DrawbridgeService(settings, database, base_dir=tmp_path)
+        seen: list[ExecutionSpec] = []
+        imported = False
+
+        async def execute(spec: ExecutionSpec) -> ExecutionResult:
+            nonlocal imported
+            seen.append(spec)
+            if spec.label == "image-build":
+                output = next(item for item in spec.argv if item.startswith("type=docker,name="))
+                archive = Path(output.split(",dest=", 1)[1])
+                archive.write_bytes(b"docker archive fixture")
+                assert str(spec.cwd).startswith(str(tmp_path / "releases"))
+                dockerfile_arg = next(item for item in spec.argv if item.startswith("dockerfile="))
+                dockerfile = Path(dockerfile_arg.removeprefix("dockerfile=")) / "Dockerfile"
+                assert "dirty" not in dockerfile.read_text(encoding="utf-8")
+                if outcome == "build_failed" and archive.name == "image-1.tar":
+                    return ExecutionResult(1, TerminationReason.EXITED, 1, "", "build failed", 0, 12, 12, False)
+                return ExecutionResult(0, TerminationReason.EXITED, 1, "", "", 0, 0, 0, False)
+            if spec.label == "image-inspect-before":
+                return ExecutionResult(1, TerminationReason.EXITED, 1, "", "No such image", 0, 13, 13, False)
+            if spec.label == "image-import":
+                imported = True
+            if spec.label == "image-identify":
+                assert imported
+                image_id = "sha256:" + ("a" if spec.argv[-1].endswith("-0") else "b") * 64
+                return ExecutionResult(0, TerminationReason.EXITED, 1, image_id + "\n", "", 72, 0, 72, False)
+            return ExecutionResult(0, TerminationReason.EXITED, 1, "", "", 0, 0, 0, False)
+
+        monkeypatch.setattr("drawbridge.service.shutil.which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(service.executor, "execute", execute)
+        registered = await service.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="compose.yaml",
+            idempotency_key="register-build-001",
+        )
+        assert registered["status"] == "ok"
+        planned = await service.release_plan(
+            app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+        )
+        assert planned["status"] == "ok"
+        (project / "api" / "Dockerfile").write_text("FROM scratch\nLABEL version=dirty\n", encoding="utf-8")
+        applied = await service.release_apply(plan_id=planned["data"]["plan_id"], idempotency_key="apply-build-001")
+        if outcome == "profile_changed":
+            settings.build_profiles["default"].platform = "linux/arm64"
+        await service.run_one_job()
+        status = await service.release_status(applied["data"]["job_id"])
+        if outcome == "profile_changed":
+            assert status["data"]["status"] == "failed"
+            assert status["data"]["error_code"] == "STALE_PLAN"
+            assert not any(item.label == "image-build" for item in seen)
+            return
+        if outcome == "build_failed":
+            assert status["data"]["status"] == "failed"
+            assert status["data"]["error_code"] == "BUILD_FAILED"
+            assert await database.get_current_release("demo", "staging") is None
+            assert not any(item.label == "compose-deploy" for item in seen)
+            assert any(item.label == "image-cleanup" for item in seen)
+            return
+        assert status["data"]["status"] == "succeeded"
+        current = await database.get_current_release("demo", "staging")
+        assert current is not None
+        runtime_compose = yaml.safe_load(Path(current["compose_file"]).read_text(encoding="utf-8"))
+        assert all("build" not in service for service in runtime_compose["services"].values())
+        assert all(service["image"].startswith("sha256:") for service in runtime_compose["services"].values())
+        assert len([item for item in seen if item.label == "image-build"]) == 2
+        assert len([item for item in seen if item.label == "image-import"]) == 2
+        assert any(item.label == "compose-deploy" for item in seen)
+    finally:
+        if database is not None:
+            await database.close()
+
+
+@pytest.mark.asyncio
+async def test_registration_rejects_unregistered_build_options(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    (project / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (project / "compose.yaml").write_text(
+        "services:\n  app:\n    build:\n      context: .\n      args: {SECRET: value}\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        build_profiles={"default": {"mode": "buildkit", "buildkit_socket": "unix:///run/buildkit/test.sock"}},
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    try:
+        service = DrawbridgeService(settings, database, base_dir=tmp_path)
+        registered = await service.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="compose.yaml",
+            idempotency_key="register-build-args-001",
+        )
+        assert registered["status"] == "error"
+        assert "unsupported build options" in registered["error"]["message"]
+        assert await database.get_binding("demo", "staging") is None
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_release_with_prebuilt_image_skips_buildkit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        build_profiles={"default": {"mode": "prebuilt"}},
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    try:
+        service = DrawbridgeService(settings, database, base_dir=tmp_path)
+        seen: list[str] = []
+
+        async def execute(spec: ExecutionSpec) -> ExecutionResult:
+            seen.append(spec.label)
+            return ExecutionResult(0, TerminationReason.EXITED, 1, "", "", 0, 0, 0, False)
+
+        monkeypatch.setattr("drawbridge.service.shutil.which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(service.executor, "execute", execute)
+        registered = await service.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="compose.yaml",
+            idempotency_key="register-prebuilt-001",
+        )
+        assert registered["status"] == "ok"
+        planned = await service.release_plan(
+            app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+        )
+        applied = await service.release_apply(plan_id=planned["data"]["plan_id"], idempotency_key="apply-prebuilt-001")
+        await service.run_one_job()
+        status = await service.release_status(applied["data"]["job_id"])
+        assert status["data"]["status"] == "succeeded"
+        assert seen == ["compose-deploy"]
+        current = await database.get_current_release("demo", "staging")
+        assert current is not None
+        assert current["image_services"] == {"app": "alpine:3.20"}
+    finally:
+        await database.close()
 
 
 @pytest.mark.asyncio

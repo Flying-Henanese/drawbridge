@@ -8,16 +8,17 @@ Drawbridge 是用于部署和运行观测的 MCP 服务。它由两个 Python �
 
 - `config.example.yaml` 默认启用 **simulation**：可以验证注册、计划、排队和发布记录，
   但不会启动业务容器。
-- 当前真实 Docker 路径只支持 Compose 中使用**已在服务器上存在的镜像**；会执行
-  `docker compose up --no-build --pull never`。包含 `build:` 的服务会返回
-  `BUILD_UNAVAILABLE`。设计文档中的 rootless BuildKit 构建流程尚未接入运行时。
+- 真实 Docker 路径可使用服务器已有镜像，也可对已登记的 `build:` 服务通过独立的
+  rootless BuildKit socket 构建。Runner 导入构建产物并用实际镜像 ID 执行
+  `docker compose up --no-build --pull never`；构建目录和 Dockerfile 必须匹配管理员 profile。
 - 已完成的 t4 验证是 simulation 验证；真实 Docker 部署尚未在该记录中验收。
   参见 [docs/VERIFICATION_RECORD.md](docs/VERIFICATION_RECORD.md)。
 
 ## 1. 准备服务器
 
 服务器需要 Linux、systemd、Python 3.12+、Git 和 `uv`。若要运行真实业务容器，
-还需要 Docker Engine、Docker Compose v2，以及已加载到本机 Docker Engine 的业务镜像。
+还需要 Docker Engine、Docker Compose v2；若由 Drawbridge 构建镜像，还需要 `buildctl`
+和单独安装的 rootless BuildKit daemon。
 先用普通用户检出项目；以下路径是示例，所有路径均需与实际服务器一致：
 
 ```sh
@@ -97,8 +98,11 @@ Runner 的 `ReadWritePaths=`。Gateway 不应获得这些额外写权限。
   `build_profiles.default.mode: simulation`；这不会部署容器。
 - **使用现有镜像部署**：设置 `allow_simulation: false`，登记的 Compose 服务只使用
   `image:`，将默认 `build_profiles.default.mode` 改为 `prebuilt`，并提前在 Runner
-  使用的 Docker Engine 中准备好镜像。不要以
-  `self-check` 通过来代替一次真实的计划、执行和健康检查验收。
+  使用的 Docker Engine 中准备好镜像。
+- **由 Drawbridge 构建后部署**：设置 `allow_simulation: false`，使用 `buildkit` profile，
+  配置本机 `unix:///.../buildkitd.sock` 和每个构建服务的 `targets`。安装及配置示例见
+  [docs/OPERATIONS.md](docs/OPERATIONS.md)。`self-check` 检查构建工具和 socket，
+  仍须单独完成真实的构建、导入、Compose 和健康检查验收。
 
 在启动前分别**以对应服务用户**执行自检，并查看 JSON 中的 `ok` 和每一项
 `blocking`/`ok`，不能仅凭命令退出码判断：

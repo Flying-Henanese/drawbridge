@@ -32,6 +32,42 @@ uv run drawbridge-runner --config config.local.yaml
    Codex CLI、Claude Code 等客户端的 SSH 隧道、token 环境变量和 MCP 配置见
    [`MCP_CLIENTS.md`](MCP_CLIENTS.md)。
 
+## 构建镜像
+
+需要构建的服务可在 Compose 中声明 `build:`。管理员在 Gateway 和 Runner 的相同配置中
+登记 `buildkit` profile。每个构建服务只能声明与 profile 对应的 `context` 和
+`dockerfile`；不接受由 Compose 提供的 build args、secret、SSH、额外 context 或自定义
+frontend。未构建的服务继续使用 `image:`。例如：
+
+```yaml
+build_profiles:
+  default:
+    mode: buildkit
+    buildkit_socket: unix:///run/user/1001/buildkit/buildkitd.sock
+    platform: linux/arm64
+    timeout_seconds: 900
+    targets:
+      api: {context: api, dockerfile: Dockerfile}
+      worker: {context: worker, dockerfile: Dockerfile}
+allow_simulation: false
+```
+
+上面的 socket 路径、平台和服务名只是示例。管理员须以**单独的普通用户**运行 rootless
+BuildKit daemon，为 socket 设置只允许 Runner 连接的属组，并在 Runner 的 systemd 单元中
+按需设置 `SupplementaryGroups=`；同时确认 `ProtectHome`、`ReadWritePaths` 没有阻止访问
+socket 和 release 目录。BuildKit daemon 不应有 Docker
+socket、部署凭据或 `security.insecure` / `network.host` entitlement。不要在无法启动
+rootless BuildKit 时回退到 `docker build`。安装方式和 rootless 限制参见
+[BuildKit 官方文档](https://github.com/moby/buildkit/blob/master/docs/rootless.md)。
+
+发布任务从固定 Git SHA 生成快照，依次对登记服务运行 `buildctl`、导出 Docker archive、
+`docker image load`、按唯一 tag 查验镜像 ID，再生成只引用镜像 ID 的运行时 Compose 文件。
+构建产物和 SHA-256 摘要保存在 release 目录。构建失败时不会执行 Compose 更新。
+`self-check` 会确认 `buildctl` 和 socket 存在，但无法证明 daemon 的隔离配置或镜像可运行；
+在真实服务器上需用非敏感测试应用验收完整的 `register → plan → apply → status` 流程。
+Compose 中的 `privileged`、`network_mode: host` 和任意 `devices` 仍会被注册校验拒绝；
+NPU 设备授权需单独设计和验收。
+
 ## t4 验证约定
 
 `/home/mineru_dev/github_repo/drawbridge` 是代码部署目录。2026-09-20 的 t4 验证已使用
