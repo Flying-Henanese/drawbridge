@@ -65,6 +65,8 @@ class DrawbridgeService:
                     "ops_service_restart": {"access": "runtime_write"},
                     "ops_workspace_patch": {"access": "workspace_write"},
                     "ops_http_request": {"access": "read or verification_write"},
+                    "ops_operation_run": {"access": "read or runtime_write"},
+                    "ops_workflow_run": {"access": "runtime_write"},
                 },
                 "workflows": {
                     "deploy_basic": {
@@ -77,6 +79,19 @@ class DrawbridgeService:
                     "max_queued_jobs": self.settings.concurrency.max_queued_jobs,
                     "simulation_enabled": self.settings.allow_simulation,
                 },
+                "getting_started": [
+                    "Register a Git-backed Compose project with ops_app_register if it is not registered.",
+                    "Create a plan with ops_release_plan using a full Git ref or commit SHA.",
+                    "Queue that plan with ops_release_apply(plan_id, idempotency_key).",
+                    "Poll ops_release_status(job_id) until succeeded or failed, then inspect status, logs, "
+                    "and HTTP evidence.",
+                ],
+                "response_contract": (
+                    "Normal operation responses have status, data, error, and request_id. status=ok can mean a "
+                    "job was queued; its final outcome is in ops_release_status. Request validation can also "
+                    "produce an MCP tool error."
+                ),
+                "supported_environments": ["staging"],
             },
             request_id=str(uuid.uuid4()),
         )

@@ -32,8 +32,8 @@ uv run drawbridge-runner --config config.local.yaml
 
 ## t4 验证约定
 
-`/home/mineru_dev/github_repo/drawbridge` 是代码部署目录。t4 当前 Docker/Compose 可用，
-但系统 Python 版本低于设计要求的 3.12，故 `drawbridge self-check` 会把 Python 基线标为
-阻断项；这次可以用单元测试和显式 simulation profile 验证队列、计划、幂等与审计，不将
-它误报为生产就绪。升级到 Python 3.12+、配置 rootless BuildKit 和管理员 token 后，才应
-切换到真实 Docker/BuildKit workflow。
+`/home/mineru_dev/github_repo/drawbridge` 是代码部署目录。2026-09-20 的 t4 验证已使用
+Python 3.12.12 虚拟环境完成 simulation 流程；结果和未覆盖项见 `VERIFICATION_RECORD.md`。
+在 t4 上复验时使用该虚拟环境与 `zsh`，先运行 `.venv/bin/python scripts/verify.py` 获取隔离证据。
+rootless BuildKit 尚未在该次验证中配置；切换到真实 Docker/BuildKit workflow 前，
+必须单独完成相关安装自检与真实服务验收，不能以 simulation 通过代替。

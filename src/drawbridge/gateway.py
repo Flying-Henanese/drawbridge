@@ -17,6 +17,17 @@ from .models import HttpRequestInput, LogsInput
 from .service import DrawbridgeService
 from .storage import Database
 
+MCP_INSTRUCTIONS = (
+    "Drawbridge is a guarded deployment and runtime observation server. Only the staging environment is supported. "
+    "Start with ops_catalog for available capabilities and limits. To deploy, register an approved project with "
+    "ops_app_register if needed, call ops_release_plan with a full Git ref or commit SHA, then pass its plan_id "
+    "to ops_release_apply with an idempotency_key (reuse it on retry). Apply queues a job: poll "
+    "ops_release_status with the "
+    "returned job_id until it succeeds or fails. Use ops_status, ops_logs, and ops_http_request for evidence. "
+    "Normal operation results use a status/data/error envelope; status=ok means the request was accepted, "
+    "not necessarily that an asynchronous job finished. Read tool descriptions before making changes."
+)
+
 
 class GatewayAccessMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: Any, settings: Settings, *, base_dir: Path) -> None:
@@ -60,7 +71,7 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
     backend = service
     mcp = FastMCP(
         name="drawbridge",
-        instructions="Drawbridge exposes guarded deployment and runtime observation operations.",
+        instructions=MCP_INSTRUCTIONS,
         stateless_http=True,
         streamable_http_path="/mcp",
         max_request_body_size=settings.ingress_max_body_bytes,
@@ -69,17 +80,32 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
     async def ready() -> None:
         await backend.database.initialize()
 
-    @mcp.tool(name="ops_catalog")
+    @mcp.tool(
+        name="ops_catalog",
+        description="Start here. Lists available operations, access levels, deployment workflow, and runtime limits.",
+    )
     async def ops_catalog() -> dict[str, Any]:
         await ready()
         return await backend.catalog()
 
-    @mcp.tool(name="ops_status")
+    @mcp.tool(
+        name="ops_status",
+        description=(
+            "Read host and registered application status. Omit app for the configured applications; "
+            "environment is staging."
+        ),
+    )
     async def ops_status(app: str | None = None, environment: str = "staging") -> dict[str, Any]:
         await ready()
         return await backend.status(app=app, environment=environment)
 
-    @mcp.tool(name="ops_logs")
+    @mcp.tool(
+        name="ops_logs",
+        description=(
+            "Read bounded logs for a registered app and Compose service. Use cursor for additional pages; "
+            "simulation releases have no container logs."
+        ),
+    )
     async def ops_logs(
         app: str,
         service: str,
@@ -103,12 +129,24 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         )
         return await backend.logs(request)
 
-    @mcp.tool(name="ops_app_discover")
+    @mcp.tool(
+        name="ops_app_discover",
+        description=(
+            "Discover existing Docker Compose candidates on the host. Results are candidates, not registered apps; "
+            "page with cursor."
+        ),
+    )
     async def ops_app_discover(limit: int = 100, cursor: str = "") -> dict[str, Any]:
         await ready()
         return await backend.app_discover(limit=limit, cursor=cursor)
 
-    @mcp.tool(name="ops_app_register")
+    @mcp.tool(
+        name="ops_app_register",
+        description=(
+            "Register a Git-backed Compose project before planning deployment. project_dir must be an absolute "
+            "directory under an allowed root; compose_file is relative to it. Reuse idempotency_key on retry."
+        ),
+    )
     async def ops_app_register(
         app: str,
         project_dir: str,
@@ -127,12 +165,18 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
             profile=profile,
         )
 
-    @mcp.tool(name="ops_git_status")
+    @mcp.tool(name="ops_git_status", description="Read Git status for a registered app's source repository.")
     async def ops_git_status(app: str, environment: str = "staging") -> dict[str, Any]:
         await ready()
         return await backend.git_status(app=app, environment=environment)
 
-    @mcp.tool(name="ops_git_log")
+    @mcp.tool(
+        name="ops_git_log",
+        description=(
+            "Read bounded Git history for a registered app. git_ref must be a full refs/heads/... or "
+            "refs/tags/... ref, or a 40-character commit SHA."
+        ),
+    )
     async def ops_git_log(
         app: str,
         git_ref: str,
@@ -142,12 +186,18 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         await ready()
         return await backend.git_log(app=app, environment=environment, git_ref=git_ref, count=count)
 
-    @mcp.tool(name="ops_process_list")
+    @mcp.tool(name="ops_process_list", description="Read a bounded host process summary.")
     async def ops_process_list() -> dict[str, Any]:
         await ready()
         return await backend.process_list()
 
-    @mcp.tool(name="ops_config_read")
+    @mcp.tool(
+        name="ops_config_read",
+        description=(
+            "Read a registered configuration file by file_alias, optionally from a historical release_id. "
+            "Arbitrary paths are not accepted."
+        ),
+    )
     async def ops_config_read(
         app: str,
         file_alias: str,
@@ -162,7 +212,13 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
             release_id=release_id,
         )
 
-    @mcp.tool(name="ops_config_validate")
+    @mcp.tool(
+        name="ops_config_validate",
+        description=(
+            "Validate a registered configuration file by file_alias, optionally from a historical release_id. "
+            "Returns validation evidence."
+        ),
+    )
     async def ops_config_validate(
         app: str,
         file_alias: str,
@@ -177,7 +233,13 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
             release_id=release_id,
         )
 
-    @mcp.tool(name="ops_release_plan")
+    @mcp.tool(
+        name="ops_release_plan",
+        description=(
+            "Create a time-limited deploy plan for a registered app. Use a full Git ref or commit SHA; "
+            "source_mode is fetch or local. Returns plan_id for ops_release_apply. Planning does not deploy."
+        ),
+    )
     async def ops_release_plan(
         app: str,
         git_ref: str,
@@ -196,17 +258,35 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
             workflow=workflow,
         )
 
-    @mcp.tool(name="ops_release_apply")
+    @mcp.tool(
+        name="ops_release_apply",
+        description=(
+            "Queue deployment of an existing plan_id. Requires idempotency_key (reuse on retry); returns job_id. "
+            "Poll ops_release_status for the final outcome."
+        ),
+    )
     async def ops_release_apply(plan_id: str, idempotency_key: str) -> dict[str, Any]:
         await ready()
         return await backend.release_apply(plan_id=plan_id, idempotency_key=idempotency_key)
 
-    @mcp.tool(name="ops_release_status")
+    @mcp.tool(
+        name="ops_release_status",
+        description=(
+            "Get the current or final state of a queued job by job_id. Use after deploy, rollback, restart, "
+            "or queued HTTP write verification."
+        ),
+    )
     async def ops_release_status(job_id: str) -> dict[str, Any]:
         await ready()
         return await backend.release_status(job_id)
 
-    @mcp.tool(name="ops_release_rollback")
+    @mcp.tool(
+        name="ops_release_rollback",
+        description=(
+            "Queue an explicit rollback to a successful historical release_id. Requires reason and idempotency_key; "
+            "poll the returned job_id."
+        ),
+    )
     async def ops_release_rollback(
         app: str,
         release_id: str,
@@ -223,7 +303,13 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
             idempotency_key=idempotency_key,
         )
 
-    @mcp.tool(name="ops_service_restart")
+    @mcp.tool(
+        name="ops_service_restart",
+        description=(
+            "Queue a restart of a registered, restartable Compose service. Requires reason and idempotency_key; "
+            "poll the returned job_id."
+        ),
+    )
     async def ops_service_restart(
         app: str,
         service: str,
@@ -240,7 +326,13 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
             idempotency_key=idempotency_key,
         )
 
-    @mcp.tool(name="ops_workspace_patch")
+    @mcp.tool(
+        name="ops_workspace_patch",
+        description=(
+            "Patch only a registered editable file_alias. Supply expected_revision from registration or the "
+            "previous patch, a merge patch, and idempotency_key; use base_commit_sha for a new revision chain."
+        ),
+    )
     async def ops_workspace_patch(
         app: str,
         file_alias: str,
@@ -261,7 +353,14 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
             base_commit_sha=base_commit_sha,
         )
 
-    @mcp.tool(name="ops_http_request")
+    @mcp.tool(
+        name="ops_http_request",
+        description=(
+            "Probe an HTTP target allowed by the configured CIDR/port policy. GET/HEAD return bounded evidence "
+            "immediately; other methods require idempotency_key, queue a job, and must be checked with "
+            "ops_release_status."
+        ),
+    )
     async def ops_http_request(
         url: str,
         method: str = "GET",
@@ -287,7 +386,14 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         )
         return await backend.http_request(request)
 
-    @mcp.tool(name="ops_operation_run")
+    @mcp.tool(
+        name="ops_operation_run",
+        description=(
+            "Compatibility dispatcher for fixed operations: service_restart, git_status, git_log, process_list, "
+            "config_read, and config_validate. Prefer dedicated tools; service_restart needs idempotency_key "
+            "and returns a job_id."
+        ),
+    )
     async def ops_operation_run(
         operation: str,
         parameters: dict[str, Any] | None = None,
@@ -350,7 +456,13 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
             "error": {"code": "UNKNOWN_OPERATION", "message": "operation is not public"},
         }
 
-    @mcp.tool(name="ops_workflow_run")
+    @mcp.tool(
+        name="ops_workflow_run",
+        description=(
+            "Compatibility entry for deploy_basic or legacy deploy_verify. Requires an existing plan_id and "
+            "idempotency_key; queues the same deployment as ops_release_apply and returns job_id."
+        ),
+    )
     async def ops_workflow_run(
         workflow: str,
         plan_id: str,
@@ -364,11 +476,13 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
             }
         return await backend.release_apply(plan_id=plan_id, idempotency_key=idempotency_key)
 
-    @mcp.resource("drawbridge://environments")
+    @mcp.resource(
+        "drawbridge://environments", description="Supported deployment environments; MVP supports staging only."
+    )
     async def environments() -> str:
         return "staging"
 
-    @mcp.resource("drawbridge://apps")
+    @mcp.resource("drawbridge://apps", description="Application names defined in the administrator configuration.")
     async def apps() -> str:
         await ready()
         bindings = []
