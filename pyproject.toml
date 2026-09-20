@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "drawbridge"
+version = "0.1.0"
+description = "A guarded MCP bridge for remote deployment and runtime observation."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "aiosqlite>=0.20,<1",
+  "httpx>=0.27,<1",
+  "mcp>=1.13,<2",
+  "pydantic>=2.8,<3",
+  "PyYAML>=6.0,<7",
+  "regex>=2024.7,<2027",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.11,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
+  "ruff>=0.6,<1",
+]
+
+[project.scripts]
+drawbridge = "drawbridge.cli:main"
+drawbridge-gateway = "drawbridge.gateway:main"
+drawbridge-runner = "drawbridge.runner:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/drawbridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "types-pyyaml>=6.0.12.20260906",
+]

@@ -1,0 +1,45 @@
+schema_version: 1
+
+# For a real server use absolute paths and auth.token_file (mode 0600).
+state_dir: ./var/state
+log_dir: ./var/log
+allowed_project_roots:
+  - ./examples
+managed_release_root: ./var/releases
+managed_template_root: ./var/templates
+managed_data_root: ./var/data
+allowed_client_cidrs:
+  - 127.0.0.1/32
+  - ::1/128
+auth:
+  mode: token
+  token: replace-with-a-random-token
+  allowed_hosts:
+    - 127.0.0.1
+    - localhost
+http_verify:
+  allowed_cidrs:
+    - 127.0.0.1/32
+    - ::1/128
+  allowed_ports: [80, 443, 8080, 18080]
+  max_read_concurrency: 8
+  timeout_seconds: 10
+  max_request_bytes: 65536
+  max_response_bytes: 262144
+  follow_redirects: false
+concurrency:
+  max_read_requests: 16
+  max_running_jobs: 1
+  max_queued_jobs: 50
+  max_queued_jobs_per_target: 5
+  queue_timeout_seconds: 600
+  min_deploy_interval_seconds: 60
+build_profiles:
+  default:
+    mode: simulation
+    context: .
+    dockerfile: Dockerfile
+    platform: linux/amd64
+allow_simulation: true
+
+apps: {}

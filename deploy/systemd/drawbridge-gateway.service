@@ -1,0 +1,22 @@
+[Unit]
+Description=Drawbridge MCP Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=drawbridge-gateway
+Group=drawbridge
+WorkingDirectory=/opt/drawbridge
+ExecStart=/opt/drawbridge/.venv/bin/drawbridge-gateway --config /etc/drawbridge/config.yaml --host 0.0.0.0 --port 8787
+Restart=on-failure
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectSystem=strict
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/drawbridge
+
+[Install]
+WantedBy=multi-user.target

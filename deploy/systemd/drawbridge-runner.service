@@ -1,0 +1,24 @@
+[Unit]
+Description=Drawbridge mutation runner
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace with the ordinary owner of the registered source repository.
+User=drawbridge-runner
+Group=docker
+WorkingDirectory=/opt/drawbridge
+ExecStart=/opt/drawbridge/.venv/bin/drawbridge-runner --config /etc/drawbridge/config.yaml
+Restart=on-failure
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectSystem=strict
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/drawbridge /srv/drawbridge
+ReadOnlyPaths=/etc/drawbridge
+
+[Install]
+WantedBy=multi-user.target
