@@ -77,6 +77,7 @@ class DataMountConfig(ConfigModel):
     host_path: StrictStr
     container_path: StrictStr
     persistent: StrictBool = True
+    read_only: StrictBool = False
 
 
 class GitConfig(ConfigModel):

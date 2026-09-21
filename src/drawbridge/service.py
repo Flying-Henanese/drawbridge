@@ -119,7 +119,14 @@ class DrawbridgeService:
             existing = await self.database.get_binding(app, environment)
             project = validate_project_path(project_dir, self.settings.resolved_allowed_roots(self.base_dir))
             relative_compose = validate_subdir(compose_file)
-            compose = parse_compose(project / relative_compose, project)
+            configured_app = self.settings.apps.get(app)
+            configured_env = configured_app.environments.get(environment) if configured_app else None
+            allowed_data_mounts = [item.model_dump() for item in configured_env.data_mounts] if configured_env else []
+            compose = parse_compose(
+                project / relative_compose,
+                project,
+                allowed_data_mounts=allowed_data_mounts,
+            )
             origin = GitRepository.detect_origin(project)
             git = GitRepository(project, origin, self._default_ref_patterns())
             git.verify_repository()
@@ -968,7 +975,14 @@ class DrawbridgeService:
             raise DrawbridgeError("PATCH_BASE_MISMATCH", "compose path escapes release snapshot") from exc
         if compose_path.is_symlink() or not compose_path.is_file():
             raise DrawbridgeError("PATCH_BASE_MISMATCH", "compose file is missing from release snapshot")
-        compose = parse_compose(compose_path, release_dir)
+        try:
+            compose = parse_compose(
+                compose_path,
+                release_dir,
+                allowed_data_mounts=binding.get("data_mounts", []),
+            )
+        except ComposeError as exc:
+            raise DrawbridgeError("INVALID_PARAMETER", f"compose validation failed: {exc}") from exc
         return {"compose": compose, "compose_file": compose_path}
 
     async def _deploy_docker(

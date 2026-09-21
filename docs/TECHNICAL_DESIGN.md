@@ -433,10 +433,12 @@ apps:
             host_path: /srv/drawbridge/data/orders-api/staging/uploads
             container_path: /var/lib/orders/uploads
             persistent: true
+            read_only: false
           - name: cache
             host_path: /srv/drawbridge/data/orders-api/staging/cache
             container_path: /var/cache/orders
             persistent: false
+            read_only: false
         health_checks:
           - type: http
             url: http://127.0.0.1:18080/healthz
@@ -478,6 +480,11 @@ Project binding 将路径能力分成四类：`source` 是可变的 Git/项目�
 `source` 的属主须与 Runner 的 systemd `User=` 一致，且为普通账户；接入时记录仓库
 规范化路径与 origin。多个 app 若由不同 Linux 用户拥有，首版不能交给同一个 Runner
 直接 fetch，需先由管理员统一仓库属主或分开部署实例。
+
+Compose 的宿主 bind 挂载在注册和发布快照阶段使用同一策略校验：短语法与 `type: bind`
+长语法都拒绝 `..`、越界路径和源路径（含父路径）中的符号链接；绝对宿主路径只有在与
+登记的 `data_mounts` 的 `host_path`、`container_path` 和 `read_only` 完全匹配时才允许。
+命名卷不会被当作本地宿主路径处理，项目内安全的相对路径可以作为源码快照的一部分使用。
 
 ### 用户接入与 Docker 发现
 
