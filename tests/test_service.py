@@ -208,6 +208,63 @@ async def test_register_uses_admin_runtime_profile_for_privileged_service(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_reregister_refreshes_admin_runtime_profile_for_same_project(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        managed_template_root=str(tmp_path / "templates"),
+        managed_data_root=str(tmp_path / "data"),
+        auth={"mode": "token", "token": "local-test-token"},
+        runtime_profiles={"ascend": {"privileged_services": ["app"]}},
+        apps={
+            "demo": {
+                "git": {
+                    "repo_path": str(project),
+                    "origin": "https://example.invalid/drawbridge.git",
+                },
+                "environments": {
+                    "staging": {
+                        "project_name": "drawbridge-demo-staging",
+                        "deployment_mode": "simulation",
+                    }
+                },
+            }
+        },
+        allow_simulation=True,
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+    first = await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-profile-refresh-001",
+    )
+    assert first["status"] == "ok"
+    assert first["data"]["version"] == 1
+
+    settings.apps["demo"].environments["staging"].runtime_profile = "ascend"
+    refreshed = await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-profile-refresh-002",
+    )
+
+    assert refreshed["status"] == "ok"
+    assert refreshed["data"]["version"] == 2
+    binding = await database.get_binding("demo", "staging")
+    assert binding is not None
+    assert binding["runtime_profile_name"] == "ascend"
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_release_snapshot_revalidates_volumes_before_executor(tmp_path: Path) -> None:
     project, _ = make_project(tmp_path / "projects")
     settings = Settings(

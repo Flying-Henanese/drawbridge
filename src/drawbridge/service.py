@@ -172,7 +172,17 @@ class DrawbridgeService:
             if existing is not None:
                 if self._binding_identity(existing) != self._binding_identity(binding):
                     raise DrawbridgeError("APP_ALREADY_REGISTERED", "app/environment is already registered")
-                return ok(self._binding_summary(existing), request_id=request_id)
+                if self._runtime_policy_identity(existing) == self._runtime_policy_identity(binding):
+                    return ok(self._binding_summary(existing), request_id=request_id)
+                version = await self.database.save_binding(app, environment, binding, status=binding["status"])
+                binding["version"] = version
+                await self.database.append_event(
+                    "app_runtime_profile_updated",
+                    self._public_summary(binding),
+                    app=app,
+                    environment=environment,
+                )
+                return ok(self._binding_summary(binding), request_id=request_id)
             version = await self.database.save_binding(app, environment, binding, status=binding["status"])
             binding["version"] = version
             await self.database.append_event(
@@ -1313,6 +1323,10 @@ class DrawbridgeService:
             binding.get("compose_file"),
             binding.get("origin"),
             tuple(binding.get("services", [])),
+        )
+
+    def _runtime_policy_identity(self, binding: dict[str, Any]) -> tuple[Any, ...]:
+        return (
             binding.get("runtime_profile_name"),
             self._digest(binding.get("runtime_profile")),
         )
