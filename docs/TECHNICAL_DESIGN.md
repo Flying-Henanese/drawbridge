@@ -486,6 +486,43 @@ Compose 的宿主 bind 挂载在注册和发布快照阶段使用同一策略校
 登记的 `data_mounts` 的 `host_path`、`container_path` 和 `read_only` 完全匹配时才允许。
 命名卷不会被当作本地宿主路径处理，项目内安全的相对路径可以作为源码快照的一部分使用。
 
+需要 NPU/GPU 等宿主能力时，管理员还可登记 `runtime_profiles`，再由特定环境通过
+`runtime_profile` 引用。profile 按服务精确登记 `privileged_services`、宿主挂载、发布端口
+和 Compose device reservation；绑定会保存 profile 内容，注册与 Git 发布快照使用同一份
+策略复验。`security_opt` 仅支持降低权限的 `no-new-privileges:true`。仓库中的 Compose
+不能自行申请 profile，也不能使用 `volumes_from`、host namespace、`cap_add`、顶层
+`driver_opts`、外部 network/config/secret 或未登记的端口和设备。
+
+以下示例展示 Ascend 服务所需的受控宿主挂载；两个 NPU 服务应分别登记同一组挂载，且
+`/etc/ascend_install.info` 必须只读，`/var/log/npu` 保持可写：
+
+```yaml
+runtime_profiles:
+  contractlens-ascend:
+    privileged_services: [paddleocr-vlm-server, paddleocr-vl-api]
+    ports:
+      api: ["8888:8888"]
+      paddleocr-vl-api: ["8880:8080"]
+    host_mounts:
+      - service: paddleocr-vlm-server
+        host_path: /etc/ascend_install.info
+        container_path: /etc/ascend_install.info
+        read_only: true
+      - service: paddleocr-vlm-server
+        host_path: /var/log/npu
+        container_path: /var/log/npu
+        read_only: false
+apps:
+  contractlens:
+    environments:
+      staging:
+        runtime_profile: contractlens-ascend
+```
+
+示例省略了每个 NPU 服务都要登记的 driver、`npu-smi`、DCMI、模型缓存和重复挂载。生产
+配置必须完整列出 Compose 中每一个绝对源路径；宿主路径或其父目录若为符号链接，应改用
+实际规范路径，不能绕过路径校验。
+
 ### 用户接入与 Docker 发现
 
 接入从本地 Git 配置读取并验证 origin，从受限 Compose schema 自动提取服务与构建信息。

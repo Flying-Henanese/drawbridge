@@ -70,8 +70,33 @@ rootless BuildKit 时回退到 `docker build`。安装方式和 rootless 限制�
 此时不会自动回滚，管理员应在检查后决定恢复动作。
 `self-check` 会确认 `buildctl` 和 socket 存在，但无法证明 daemon 的隔离配置或镜像可运行；
 在真实服务器上需用非敏感测试应用验收完整的 `register → plan → apply → status` 流程。
-Compose 中的 `privileged`、`network_mode: host` 和任意 `devices` 仍会被注册校验拒绝；
-NPU 设备授权需单独设计和验收。
+Compose 默认拒绝 `privileged`、host namespace、任意端口、任意设备和绝对宿主挂载。
+NPU/GPU 应由管理员在配置文件的 `runtime_profiles` 中按服务精确登记，再由目标环境的
+`runtime_profile` 引用；仓库 Compose 不能自行开启这些能力。profile 可登记：
+
+- `privileged_services`：仅允许列出的服务使用严格布尔值 `privileged: true`；
+- `host_mounts`：精确匹配 service、规范化 host/container 路径和 `read_only`；
+- `ports`：精确匹配发布 IP、宿主端口、容器端口和协议；
+- `device_reservations`：精确匹配 Compose deploy reservation 的 driver、device IDs 和 capabilities。
+
+Ascend profile 应为每个实际 NPU 服务登记 driver、`npu-smi`、DCMI 和模型缓存挂载，并加入：
+
+```yaml
+- service: paddleocr-vlm-server
+  host_path: /etc/ascend_install.info
+  container_path: /etc/ascend_install.info
+  read_only: true
+- service: paddleocr-vlm-server
+  host_path: /var/log/npu
+  container_path: /var/log/npu
+  read_only: false
+```
+
+对 `paddleocr-vl-api` 重复登记这两项。`/etc/ascend_install.info` 只读，`/var/log/npu` 可写。
+Compose 必须使用已渲染的固定值，不能保留 `${...}`；BuildKit 的 `build:` 仍只接受登记的
+context/dockerfile，不能通过 `build.args` 传入动态构建能力。启动前以 Runner 用户确认所有
+宿主路径存在、没有符号链接且可读/可写，并用 `npu-smi info` 验证驱动。允许
+`privileged` 只解决 Docker 隔离策略，不会安装驱动，也不会修复宿主文件权限。
 
 ## t4 验证约定
 

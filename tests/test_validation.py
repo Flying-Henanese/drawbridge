@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from drawbridge.compose import ComposeError, parse_compose
-from drawbridge.config import DataMountConfig
+from drawbridge.config import DataMountConfig, Settings
 from drawbridge.models import (
     HttpRequestInput,
     IdempotencyInput,
@@ -118,6 +118,29 @@ def test_compose_rejects_absolute_and_symlinked_host_paths(tmp_path: Path) -> No
             parse_compose(_write_compose(project, [volume]), project)
 
 
+def test_compose_rejects_unreviewed_long_volume_options(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "source"
+    source.mkdir()
+
+    with pytest.raises(ComposeError, match="unsupported volume key bind"):
+        parse_compose(
+            _write_compose(
+                project,
+                [
+                    {
+                        "type": "bind",
+                        "source": "./source",
+                        "target": "/data",
+                        "bind": {"propagation": "rshared"},
+                    }
+                ],
+            ),
+            project,
+        )
+
+
 def test_compose_rejects_a_symlinked_compose_file(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -196,4 +219,212 @@ def test_data_mount_read_only_is_strict() -> None:
             host_path="/srv/drawbridge/data/uploads",
             container_path="/var/lib/app/uploads",
             read_only="true",
+        )
+
+
+@pytest.mark.parametrize(
+    ("service_field", "expected_field"),
+    [
+        ("volumes_from: [other]", "volumes_from"),
+        ("userns_mode: host", "userns_mode"),
+        ("uts: host", "uts"),
+        ("network_mode: host", "network_mode"),
+        ("devices: [/dev/npu0:/dev/npu0]", "devices"),
+        ("cap_add: [SYS_ADMIN]", "cap_add"),
+    ],
+)
+def test_compose_rejects_unreviewed_service_capabilities(
+    tmp_path: Path, service_field: str, expected_field: str
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    compose = project / "compose.yaml"
+    compose.write_text(
+        f"services:\n  app:\n    image: alpine:3.20\n    {service_field}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ComposeError, match=expected_field):
+        parse_compose(compose, project)
+
+
+def test_compose_rejects_top_level_volume_host_options_but_allows_managed_named_volume(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    compose = project / "compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  app:\n"
+        "    image: alpine:3.20\n"
+        "    volumes: [cache:/var/lib/app]\n"
+        "volumes:\n"
+        "  cache:\n"
+        "    driver_opts:\n"
+        "      type: none\n"
+        "      device: /etc\n"
+        "      o: bind\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ComposeError, match="driver_opts"):
+        parse_compose(compose, project)
+
+    compose.write_text(
+        "services:\n  app:\n    image: alpine:3.20\n    volumes: [cache:/var/lib/app]\nvolumes:\n  cache: {}\n",
+        encoding="utf-8",
+    )
+    assert parse_compose(compose, project).services == ("app",)
+
+
+@pytest.mark.parametrize(
+    ("resource", "declaration", "expected"),
+    [
+        ("configs", "app-config: {file: ./config.yaml}", "configs"),
+        ("secrets", "app-secret: {file: ./secret.txt}", "secrets"),
+        ("networks", "host-net: {external: true}", "external"),
+    ],
+)
+def test_compose_rejects_unsupported_top_level_resources(
+    tmp_path: Path, resource: str, declaration: str, expected: str
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    compose = project / "compose.yaml"
+    compose.write_text(
+        f"services:\n  app:\n    image: alpine:3.20\n{resource}:\n  {declaration}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ComposeError, match=expected):
+        parse_compose(compose, project)
+
+
+def test_compose_allows_only_exact_ascend_runtime_profile(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    driver = tmp_path / "driver"
+    driver.mkdir()
+    install_info = tmp_path / "ascend_install.info"
+    install_info.write_text("version=1\n", encoding="utf-8")
+    npu_log = tmp_path / "npu-log"
+    npu_log.mkdir()
+    compose = project / "compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  api:\n"
+        "    image: alpine:3.20\n"
+        "    security_opt: [no-new-privileges:true]\n"
+        "    ports: [8888:8888]\n"
+        "  npu:\n"
+        "    image: ascend.invalid/server:latest\n"
+        "    privileged: true\n"
+        "    volumes:\n"
+        f"      - {driver}:/usr/local/Ascend/driver:ro\n"
+        f"      - {install_info}:/etc/ascend_install.info:ro\n"
+        f"      - {npu_log}:/var/log/npu\n",
+        encoding="utf-8",
+    )
+    runtime_profile = {
+        "privileged_services": ["npu"],
+        "ports": {"api": ["8888:8888"]},
+        "host_mounts": [
+            {
+                "service": "npu",
+                "host_path": str(driver),
+                "container_path": "/usr/local/Ascend/driver",
+                "read_only": True,
+            },
+            {
+                "service": "npu",
+                "host_path": str(install_info),
+                "container_path": "/etc/ascend_install.info",
+                "read_only": True,
+            },
+            {
+                "service": "npu",
+                "host_path": str(npu_log),
+                "container_path": "/var/log/npu",
+                "read_only": False,
+            },
+        ],
+    }
+
+    spec = parse_compose(compose, project, runtime_profile=runtime_profile)
+    assert spec.services == ("api", "npu")
+
+    runtime_profile["ports"] = {"api": ["127.0.0.1:8888:8888"]}
+    with pytest.raises(ComposeError, match="published ports"):
+        parse_compose(compose, project, runtime_profile=runtime_profile)
+
+    runtime_profile["ports"] = {"api": ["8888:8888"]}
+    runtime_profile["host_mounts"][2]["read_only"] = True
+    with pytest.raises(ComposeError, match="registered host mount"):
+        parse_compose(compose, project, runtime_profile=runtime_profile)
+
+
+def test_compose_allows_only_exact_registered_device_reservations(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    compose = project / "compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  gpu:\n"
+        "    image: nvidia.invalid/server:latest\n"
+        "    deploy:\n"
+        "      resources:\n"
+        "        reservations:\n"
+        "          devices:\n"
+        "            - driver: nvidia\n"
+        "              device_ids: ['4']\n"
+        "              capabilities: [gpu]\n",
+        encoding="utf-8",
+    )
+    profile = {"device_reservations": {"gpu": [{"driver": "nvidia", "device_ids": ["4"], "capabilities": ["gpu"]}]}}
+
+    assert parse_compose(compose, project, runtime_profile=profile).services == ("gpu",)
+    profile["device_reservations"]["gpu"][0]["device_ids"] = ["5"]
+    with pytest.raises(ComposeError, match="device reservations"):
+        parse_compose(compose, project, runtime_profile=profile)
+
+
+def test_runtime_profile_configuration_is_strict_and_must_exist() -> None:
+    settings = Settings(
+        auth={"mode": "token", "token": "local-test-token"},
+        runtime_profiles={
+            "ascend": {
+                "privileged_services": ["npu"],
+                "host_mounts": [
+                    {
+                        "service": "npu",
+                        "host_path": "/etc/ascend_install.info",
+                        "container_path": "/etc/ascend_install.info",
+                        "read_only": True,
+                    },
+                    {
+                        "service": "npu",
+                        "host_path": "/var/log/npu",
+                        "container_path": "/var/log/npu",
+                        "read_only": False,
+                    },
+                ],
+            }
+        },
+        apps={
+            "demo": {
+                "git": {"repo_path": "/srv/demo", "origin": "https://example.invalid/demo.git"},
+                "environments": {"staging": {"project_name": "demo", "runtime_profile": "ascend"}},
+            }
+        },
+    )
+    assert settings.apps["demo"].environments["staging"].runtime_profile == "ascend"
+
+    with pytest.raises(ValidationError, match="runtime_profile"):
+        Settings(
+            auth={"mode": "token", "token": "local-test-token"},
+            apps={
+                "demo": {
+                    "git": {"repo_path": "/srv/demo", "origin": "https://example.invalid/demo.git"},
+                    "environments": {"staging": {"project_name": "demo", "runtime_profile": "missing"}},
+                }
+            },
         )

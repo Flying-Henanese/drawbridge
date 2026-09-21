@@ -135,6 +135,79 @@ async def test_register_rejects_unsafe_volume_without_creating_binding(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_register_uses_admin_runtime_profile_for_privileged_service(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    install_info = tmp_path / "ascend_install.info"
+    install_info.write_text("version=1\n", encoding="utf-8")
+    (project / "compose.yaml").write_text(
+        "services:\n"
+        "  npu:\n"
+        "    image: ascend.invalid/server:latest\n"
+        "    privileged: true\n"
+        "    ports: [8118:8118]\n"
+        "    volumes:\n"
+        f"      - {install_info}:/etc/ascend_install.info:ro\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        managed_template_root=str(tmp_path / "templates"),
+        managed_data_root=str(tmp_path / "data"),
+        auth={"mode": "token", "token": "local-test-token"},
+        runtime_profiles={
+            "ascend": {
+                "privileged_services": ["npu"],
+                "ports": {"npu": ["8118:8118"]},
+                "host_mounts": [
+                    {
+                        "service": "npu",
+                        "host_path": str(install_info),
+                        "container_path": "/etc/ascend_install.info",
+                        "read_only": True,
+                    }
+                ],
+            }
+        },
+        apps={
+            "demo": {
+                "git": {
+                    "repo_path": str(project),
+                    "origin": "https://example.invalid/drawbridge.git",
+                },
+                "environments": {
+                    "staging": {
+                        "project_name": "drawbridge-demo-staging",
+                        "deployment_mode": "simulation",
+                        "runtime_profile": "ascend",
+                    }
+                },
+            }
+        },
+        allow_simulation=True,
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+
+    registered = await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-ascend-001",
+    )
+
+    assert registered["status"] == "ok"
+    binding = await database.get_binding("demo", "staging")
+    assert binding is not None
+    assert binding["runtime_profile_name"] == "ascend"
+    assert binding["runtime_profile"]["privileged_services"] == ["npu"]
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_release_snapshot_revalidates_volumes_before_executor(tmp_path: Path) -> None:
     project, _ = make_project(tmp_path / "projects")
     settings = Settings(
@@ -185,6 +258,61 @@ async def test_release_snapshot_revalidates_volumes_before_executor(tmp_path: Pa
     assert status["status"] == "ok"
     assert status["data"]["status"] == "failed"
     assert status["data"]["error_code"] == "INVALID_PARAMETER"
+    assert seen == []
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_release_snapshot_revalidates_host_capabilities_before_executor(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        managed_template_root=str(tmp_path / "templates"),
+        managed_data_root=str(tmp_path / "data"),
+        auth={"mode": "token", "token": "local-test-token"},
+        allow_simulation=True,
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+
+    registered = await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-capability-001",
+    )
+    assert registered["status"] == "ok"
+
+    (project / "compose.yaml").write_text(
+        "services:\n  app:\n    image: alpine:3.20\n    volumes_from: [other]\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "compose.yaml"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "add host capability"], cwd=project, check=True, capture_output=True)
+    planned = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+    assert planned["status"] == "ok"
+
+    seen: list[ExecutionSpec] = []
+
+    async def execute(spec: ExecutionSpec) -> ExecutionResult:
+        seen.append(spec)
+        raise AssertionError("unsafe snapshot must fail before external execution")
+
+    service.executor.execute = execute
+    applied = await service.release_apply(plan_id=planned["data"]["plan_id"], idempotency_key="apply-capability-001")
+    assert applied["status"] == "ok"
+    await service.run_one_job()
+    status = await service.release_status(applied["data"]["job_id"])
+
+    assert status["data"]["status"] == "failed"
+    assert status["data"]["error_code"] == "INVALID_PARAMETER"
+    assert "volumes_from" in status["data"]["message"]
     assert seen == []
     await database.close()
 

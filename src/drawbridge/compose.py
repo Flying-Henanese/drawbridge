@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import shutil
@@ -32,11 +33,53 @@ class _AllowedDataMount:
     read_only: bool
 
 
+@dataclass(frozen=True)
+class _AllowedHostMount:
+    service: str
+    host_path: Path
+    container_path: str
+    read_only: bool
+
+
+@dataclass(frozen=True)
+class _RuntimePolicy:
+    privileged_services: frozenset[str]
+    host_mounts: tuple[_AllowedHostMount, ...]
+    ports: dict[str, frozenset[tuple[str, int, int, str]]]
+    device_reservations: dict[str, tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]]
+
+
+_ALLOWED_SERVICE_KEYS = {
+    "build",
+    "command",
+    "depends_on",
+    "deploy",
+    "entrypoint",
+    "environment",
+    "env_file",
+    "healthcheck",
+    "image",
+    "init",
+    "ports",
+    "privileged",
+    "read_only",
+    "restart",
+    "security_opt",
+    "shm_size",
+    "stop_grace_period",
+    "tmpfs",
+    "user",
+    "volumes",
+    "working_dir",
+}
+
+
 def parse_compose(
     path: Path,
     project_dir: Path,
     *,
     allowed_data_mounts: Sequence[Mapping[str, Any]] | None = None,
+    runtime_profile: Mapping[str, Any] | None = None,
 ) -> ComposeSpec:
     if not path.is_absolute():
         path = project_dir / path
@@ -66,6 +109,8 @@ def parse_compose(
     if unknown_root:
         raise ComposeError(f"unsupported compose top-level keys: {sorted(unknown_root)}")
     normalized_data_mounts = _normalize_data_mounts(allowed_data_mounts or ())
+    policy = _normalize_runtime_profile(runtime_profile or {})
+    _validate_top_level_resources(raw)
 
     services: list[str] = []
     image_services: dict[str, str] = {}
@@ -75,11 +120,11 @@ def parse_compose(
             raise ComposeError(f"invalid service name: {name!r}")
         if not isinstance(service, dict):
             raise ComposeError(f"service {name} must be a mapping")
-        if "extends" in service or "privileged" in service and service["privileged"]:
-            raise ComposeError(f"service {name} uses an unsupported privilege feature")
-        for key in ("pid", "ipc", "network_mode", "devices", "cap_add", "security_opt"):
-            if key in service:
-                raise ComposeError(f"service {name} uses unsupported key {key}")
+        unknown_service_keys = set(service) - _ALLOWED_SERVICE_KEYS
+        if unknown_service_keys:
+            field = sorted(unknown_service_keys)[0]
+            raise ComposeError(f"service {name} uses unsupported key {field}")
+        _validate_service_capabilities(name, service, policy)
         if "environment" in service and isinstance(service["environment"], dict):
             for key, value in service["environment"].items():
                 if isinstance(value, str) and "${" in value:
@@ -88,7 +133,13 @@ def parse_compose(
             if "${" in value:
                 raise ComposeError(f"dynamic interpolation is not allowed in service {name}")
         if "volumes" in service:
-            _validate_volumes(name, service["volumes"], project_dir, normalized_data_mounts)
+            _validate_volumes(
+                name,
+                service["volumes"],
+                project_dir,
+                normalized_data_mounts,
+                policy.host_mounts,
+            )
         if "env_file" in service:
             _validate_env_files(name, service["env_file"], project_dir)
         image = service.get("image")
@@ -183,6 +234,202 @@ def docker_discover(*, max_items: int = 1000) -> list[dict[str, Any]]:
     return candidates
 
 
+def _normalize_runtime_profile(value: Mapping[str, Any]) -> _RuntimePolicy:
+    allowed_keys = {"privileged_services", "host_mounts", "ports", "device_reservations"}
+    unknown = set(value) - allowed_keys
+    if unknown:
+        raise ComposeError(f"runtime profile contains unsupported keys: {sorted(unknown)}")
+
+    privileged_values = value.get("privileged_services", [])
+    if not isinstance(privileged_values, list) or not all(isinstance(item, str) for item in privileged_values):
+        raise ComposeError("runtime profile privileged_services must be a list of service names")
+    privileged_services = frozenset(privileged_values)
+
+    host_values = value.get("host_mounts", [])
+    if not isinstance(host_values, list):
+        raise ComposeError("runtime profile host_mounts must be a list")
+    host_mounts: list[_AllowedHostMount] = []
+    for item in host_values:
+        if not isinstance(item, Mapping) or set(item) != {
+            "service",
+            "host_path",
+            "container_path",
+            "read_only",
+        }:
+            raise ComposeError("runtime profile host mount must declare exact service, paths, and read_only")
+        service = item["service"]
+        host_value = item["host_path"]
+        container_path = item["container_path"]
+        read_only = item["read_only"]
+        if (
+            not isinstance(service, str)
+            or not isinstance(host_value, str)
+            or not isinstance(container_path, str)
+            or type(read_only) is not bool
+        ):
+            raise ComposeError("runtime profile host mount fields have invalid types")
+        host_path = Path(host_value)
+        if not host_path.is_absolute():
+            raise ComposeError("runtime profile host_path must be absolute")
+        _reject_parent_segments(host_path, "runtime profile host_path")
+        _validate_container_target(container_path, "runtime profile host mount")
+        host_mounts.append(
+            _AllowedHostMount(
+                service=service,
+                host_path=_normalize_host_path(host_path, "runtime profile host_path"),
+                container_path=container_path,
+                read_only=read_only,
+            )
+        )
+
+    port_values = value.get("ports", {})
+    if not isinstance(port_values, Mapping):
+        raise ComposeError("runtime profile ports must be a service mapping")
+    ports: dict[str, frozenset[tuple[str, int, int, str]]] = {}
+    for service, entries in port_values.items():
+        if not isinstance(service, str) or not isinstance(entries, list):
+            raise ComposeError("runtime profile ports must map service names to lists")
+        ports[service] = frozenset(_normalize_published_port(entry, "runtime profile") for entry in entries)
+
+    device_values = value.get("device_reservations", {})
+    if not isinstance(device_values, Mapping):
+        raise ComposeError("runtime profile device_reservations must be a service mapping")
+    device_reservations: dict[str, tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]] = {}
+    for service, entries in device_values.items():
+        if not isinstance(service, str) or not isinstance(entries, list):
+            raise ComposeError("runtime profile device_reservations must map service names to lists")
+        device_reservations[service] = tuple(
+            _normalize_device_reservation(entry, f"runtime profile for {service}") for entry in entries
+        )
+    return _RuntimePolicy(
+        privileged_services=privileged_services,
+        host_mounts=tuple(host_mounts),
+        ports=ports,
+        device_reservations=device_reservations,
+    )
+
+
+def _validate_top_level_resources(raw: Mapping[str, Any]) -> None:
+    volumes = raw.get("volumes")
+    if volumes is not None:
+        _validate_local_named_resources(volumes, "volume")
+    networks = raw.get("networks")
+    if networks is not None:
+        _validate_local_named_resources(networks, "network")
+    for key in ("configs", "secrets"):
+        if raw.get(key):
+            raise ComposeError(f"compose top-level {key} are not supported")
+
+
+def _validate_local_named_resources(value: Any, resource: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ComposeError(f"compose top-level {resource}s must be a mapping")
+    for name, options in value.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name):
+            raise ComposeError(f"invalid top-level {resource} name")
+        if options not in (None, {}):
+            if isinstance(options, Mapping):
+                field = sorted(str(key) for key in options)[0] if options else "options"
+                raise ComposeError(f"top-level {resource} {name} uses unsupported key {field}")
+            raise ComposeError(f"top-level {resource} {name} must use an empty local declaration")
+
+
+def _validate_service_capabilities(name: str, service: Mapping[str, Any], policy: _RuntimePolicy) -> None:
+    if "privileged" in service:
+        privileged = service["privileged"]
+        if type(privileged) is not bool:
+            raise ComposeError(f"service {name}.privileged must be a boolean")
+        if privileged and name not in policy.privileged_services:
+            raise ComposeError(f"service {name} privileged mode is not registered")
+
+    if "security_opt" in service:
+        options = service["security_opt"]
+        if (
+            not isinstance(options, list)
+            or not options
+            or any(option != "no-new-privileges:true" for option in options)
+        ):
+            raise ComposeError(f"service {name} uses unsupported security_opt")
+
+    if "ports" in service:
+        values = service["ports"]
+        if not isinstance(values, list):
+            raise ComposeError(f"service {name}.ports must be a list")
+        actual = frozenset(_normalize_published_port(value, f"service {name}") for value in values)
+        if actual != policy.ports.get(name, frozenset()):
+            raise ComposeError(f"service {name} published ports do not match its runtime profile")
+
+    if "deploy" in service:
+        _validate_deploy(name, service["deploy"], policy)
+
+
+def _normalize_published_port(value: Any, description: str) -> tuple[str, int, int, str]:
+    if not isinstance(value, str):
+        raise ComposeError(f"published port in {description} must use short string syntax")
+    port_value, separator, protocol = value.partition("/")
+    if separator and protocol not in {"tcp", "udp"}:
+        raise ComposeError(f"published port in {description} uses an unsupported protocol")
+    protocol = protocol or "tcp"
+    parts = port_value.split(":")
+    if len(parts) == 2:
+        host_ip = "0.0.0.0"
+        published_value, target_value = parts
+    elif len(parts) == 3:
+        host_ip, published_value, target_value = parts
+        try:
+            ipaddress.ip_address(host_ip)
+        except ValueError as exc:
+            raise ComposeError(f"published port in {description} has an invalid host IP") from exc
+    else:
+        raise ComposeError(f"published port in {description} must declare host and container ports")
+    try:
+        published = int(published_value)
+        target = int(target_value)
+    except ValueError as exc:
+        raise ComposeError(f"published port in {description} must use integer ports") from exc
+    if not 1 <= published <= 65535 or not 1 <= target <= 65535:
+        raise ComposeError(f"published port in {description} is outside the valid range")
+    return host_ip, published, target, protocol
+
+
+def _validate_deploy(name: str, value: Any, policy: _RuntimePolicy) -> None:
+    if not isinstance(value, Mapping) or set(value) - {"resources"}:
+        raise ComposeError(f"service {name}.deploy contains unsupported options")
+    resources = value.get("resources", {})
+    if not isinstance(resources, Mapping) or set(resources) - {"limits", "reservations"}:
+        raise ComposeError(f"service {name}.deploy.resources contains unsupported options")
+    limits = resources.get("limits", {})
+    if not isinstance(limits, Mapping) or set(limits) - {"cpus", "memory", "pids"}:
+        raise ComposeError(f"service {name}.deploy.resources.limits contains unsupported options")
+    reservations = resources.get("reservations", {})
+    if not isinstance(reservations, Mapping) or set(reservations) - {"cpus", "memory", "devices"}:
+        raise ComposeError(f"service {name}.deploy.resources.reservations contains unsupported options")
+    devices = reservations.get("devices", [])
+    if not isinstance(devices, list):
+        raise ComposeError(f"service {name} device reservations must be a list")
+    actual = tuple(_normalize_device_reservation(item, f"service {name}") for item in devices)
+    if actual != policy.device_reservations.get(name, ()):
+        raise ComposeError(f"service {name} device reservations do not match its runtime profile")
+
+
+def _normalize_device_reservation(value: Any, description: str) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    if not isinstance(value, Mapping) or set(value) != {"driver", "device_ids", "capabilities"}:
+        raise ComposeError(f"device reservation in {description} must use exact registered fields")
+    driver = value["driver"]
+    device_ids = value["device_ids"]
+    capabilities = value["capabilities"]
+    if (
+        not isinstance(driver, str)
+        or not isinstance(device_ids, list)
+        or not all(isinstance(item, str) for item in device_ids)
+        or not isinstance(capabilities, list)
+        or not capabilities
+        or not all(isinstance(item, str) for item in capabilities)
+    ):
+        raise ComposeError(f"device reservation in {description} has invalid types")
+    return driver, tuple(device_ids), tuple(capabilities)
+
+
 def _walk_strings(value: Any) -> Iterator[str]:
     if isinstance(value, str):
         yield value
@@ -201,6 +448,7 @@ def _validate_volumes(
     volumes: Any,
     project_dir: Path,
     allowed_data_mounts: tuple[_AllowedDataMount, ...],
+    allowed_host_mounts: tuple[_AllowedHostMount, ...],
 ) -> None:
     if not isinstance(volumes, list):
         raise ComposeError(f"service {service_name}.volumes must be a list")
@@ -216,10 +464,11 @@ def _validate_volumes(
                     read_only=read_only,
                     project_dir=project_dir,
                     allowed_data_mounts=allowed_data_mounts,
+                    allowed_host_mounts=allowed_host_mounts,
                     explicit_bind=False,
                 )
         elif isinstance(volume, dict):
-            _validate_long_volume(service_name, volume, project_dir, allowed_data_mounts)
+            _validate_long_volume(service_name, volume, project_dir, allowed_data_mounts, allowed_host_mounts)
         else:
             raise ComposeError(f"invalid volume in {service_name}")
 
@@ -276,7 +525,12 @@ def _validate_long_volume(
     volume: dict[Any, Any],
     project_dir: Path,
     allowed_data_mounts: tuple[_AllowedDataMount, ...],
+    allowed_host_mounts: tuple[_AllowedHostMount, ...],
 ) -> None:
+    unknown_keys = set(volume) - {"type", "source", "target", "read_only"}
+    if unknown_keys:
+        field = sorted(str(key) for key in unknown_keys)[0]
+        raise ComposeError(f"unsupported volume key {field} in {service_name}")
     volume_type = volume.get("type")
     if volume_type is not None and not isinstance(volume_type, str):
         raise ComposeError(f"volume type must be a string in {service_name}")
@@ -316,6 +570,7 @@ def _validate_long_volume(
         read_only=read_only,
         project_dir=project_dir,
         allowed_data_mounts=allowed_data_mounts,
+        allowed_host_mounts=allowed_host_mounts,
         explicit_bind=explicit_bind,
     )
 
@@ -328,6 +583,7 @@ def _validate_volume_source(
     read_only: bool,
     project_dir: Path,
     allowed_data_mounts: tuple[_AllowedDataMount, ...],
+    allowed_host_mounts: tuple[_AllowedHostMount, ...],
     explicit_bind: bool,
 ) -> None:
     source_path = Path(source)
@@ -340,6 +596,7 @@ def _validate_volume_source(
             target=target,
             read_only=read_only,
             allowed_data_mounts=allowed_data_mounts,
+            allowed_host_mounts=allowed_host_mounts,
             absolute=True,
         )
         return
@@ -363,6 +620,7 @@ def _validate_volume_source(
         target=target,
         read_only=read_only,
         allowed_data_mounts=allowed_data_mounts,
+        allowed_host_mounts=allowed_host_mounts,
         absolute=False,
     )
 
@@ -374,10 +632,23 @@ def _require_registered_data_mount(
     target: str,
     read_only: bool,
     allowed_data_mounts: tuple[_AllowedDataMount, ...],
+    allowed_host_mounts: tuple[_AllowedHostMount, ...],
     absolute: bool,
 ) -> None:
     same_source = [mount for mount in allowed_data_mounts if mount.host_path == source]
+    exact_runtime_mount = any(
+        mount.service == service_name
+        and mount.host_path == source
+        and mount.container_path == target
+        and mount.read_only == read_only
+        for mount in allowed_host_mounts
+    )
+    if exact_runtime_mount:
+        return
+    runtime_source = any(mount.service == service_name and mount.host_path == source for mount in allowed_host_mounts)
     if not same_source:
+        if runtime_source:
+            raise ComposeError(f"volume does not exactly match a registered host mount in {service_name}")
         if absolute:
             raise ComposeError(f"absolute host volume is not a registered data mount in {service_name}")
         return

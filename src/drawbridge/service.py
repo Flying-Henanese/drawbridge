@@ -122,10 +122,12 @@ class DrawbridgeService:
             configured_app = self.settings.apps.get(app)
             configured_env = configured_app.environments.get(environment) if configured_app else None
             allowed_data_mounts = [item.model_dump() for item in configured_env.data_mounts] if configured_env else []
+            runtime_profile = self._runtime_profile_payload(configured_env)
             compose = parse_compose(
                 project / relative_compose,
                 project,
                 allowed_data_mounts=allowed_data_mounts,
+                runtime_profile=runtime_profile,
             )
             origin = GitRepository.detect_origin(project)
             git = GitRepository(project, origin, self._default_ref_patterns())
@@ -980,6 +982,7 @@ class DrawbridgeService:
                 compose_path,
                 release_dir,
                 allowed_data_mounts=binding.get("data_mounts", []),
+                runtime_profile=binding.get("runtime_profile"),
             )
         except ComposeError as exc:
             raise DrawbridgeError("INVALID_PARAMETER", f"compose validation failed: {exc}") from exc
@@ -1235,6 +1238,8 @@ class DrawbridgeService:
             "deployment_mode": env.deployment_mode,
             "current_revision": None,
             "data_mounts": [item.model_dump() for item in env.data_mounts],
+            "runtime_profile_name": env.runtime_profile,
+            "runtime_profile": self._runtime_profile_payload(env),
         }
 
     def _new_binding(
@@ -1259,6 +1264,7 @@ class DrawbridgeService:
         )
         health_checks = [item.model_dump() for item in configured_env.health_checks] if configured_env else []
         data_mounts = [item.model_dump() for item in configured_env.data_mounts] if configured_env else []
+        runtime_profile = self._runtime_profile_payload(configured_env)
         return {
             "app": app,
             "environment": environment,
@@ -1281,6 +1287,8 @@ class DrawbridgeService:
             "release_root": str(release_root),
             "data_root": str(data_root),
             "data_mounts": data_mounts,
+            "runtime_profile_name": configured_env.runtime_profile if configured_env else None,
+            "runtime_profile": runtime_profile,
             "deployment_mode": configured_env.deployment_mode
             if configured_env
             else ("simulation" if self.settings.allow_simulation else "docker"),
@@ -1299,14 +1307,20 @@ class DrawbridgeService:
             r"^refs/tags/v[0-9][A-Za-z0-9._-]*$",
         ]
 
-    @staticmethod
-    def _binding_identity(binding: dict[str, Any]) -> tuple[Any, ...]:
+    def _binding_identity(self, binding: dict[str, Any]) -> tuple[Any, ...]:
         return (
             binding.get("source_workspace"),
             binding.get("compose_file"),
             binding.get("origin"),
             tuple(binding.get("services", [])),
+            binding.get("runtime_profile_name"),
+            self._digest(binding.get("runtime_profile")),
         )
+
+    def _runtime_profile_payload(self, environment: EnvironmentConfig | None) -> dict[str, Any] | None:
+        if environment is None or environment.runtime_profile is None:
+            return None
+        return self.settings.runtime_profiles[environment.runtime_profile].model_dump()
 
     @staticmethod
     def _binding_summary(binding: dict[str, Any]) -> dict[str, Any]:

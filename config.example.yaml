@@ -41,6 +41,9 @@ build_profiles:
     context: .
     dockerfile: Dockerfile
     platform: linux/amd64
+# Hardware-specific host access is disabled unless an app environment names
+# an administrator-defined runtime profile. See docs/OPERATIONS.md.
+runtime_profiles: {}
 allow_simulation: true
 
 apps: {}

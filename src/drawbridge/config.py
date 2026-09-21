@@ -14,6 +14,7 @@ from pydantic import (
     StrictInt,
     StrictStr,
     field_validator,
+    model_validator,
 )
 
 from .models import validate_cidr_list
@@ -80,6 +81,26 @@ class DataMountConfig(ConfigModel):
     read_only: StrictBool = False
 
 
+class RuntimeHostMountConfig(ConfigModel):
+    service: StrictStr = Field(min_length=1, max_length=64, pattern=r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}")
+    host_path: StrictStr
+    container_path: StrictStr
+    read_only: StrictBool = False
+
+
+class RuntimeDeviceReservationConfig(ConfigModel):
+    driver: StrictStr = Field(min_length=1, max_length=64)
+    device_ids: list[StrictStr] = Field(default_factory=list)
+    capabilities: list[StrictStr] = Field(min_length=1)
+
+
+class RuntimeProfileConfig(ConfigModel):
+    privileged_services: list[StrictStr] = Field(default_factory=list)
+    host_mounts: list[RuntimeHostMountConfig] = Field(default_factory=list)
+    ports: dict[StrictStr, list[StrictStr]] = Field(default_factory=dict)
+    device_reservations: dict[StrictStr, list[RuntimeDeviceReservationConfig]] = Field(default_factory=dict)
+
+
 class GitConfig(ConfigModel):
     repo_path: StrictStr
     origin: StrictStr
@@ -113,6 +134,7 @@ class EnvironmentConfig(ConfigModel):
     test_suites: dict[str, TestSuiteConfig] = Field(default_factory=dict)
     deployment_mode: Literal["docker", "simulation"] = "docker"
     prebuilt_image: StrictStr | None = None
+    runtime_profile: StrictStr | None = None
 
 
 class AppConfig(ConfigModel):
@@ -146,11 +168,23 @@ class Settings(ConfigModel):
     auth: AuthConfig = Field(default_factory=AuthConfig)
     http_verify: HttpVerifyConfig = Field(default_factory=HttpVerifyConfig)
     concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
+    runtime_profiles: dict[str, RuntimeProfileConfig] = Field(default_factory=dict)
     apps: dict[str, AppConfig] = Field(default_factory=dict)
     build_profiles: dict[str, BuildProfile] = Field(default_factory=lambda: {"default": BuildProfile()})
     allow_simulation: StrictBool = False
     ingress_max_body_bytes: StrictInt = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024)
     poll_interval_seconds: StrictFloat = Field(default=1.0, gt=0.05, le=30)
+
+    @model_validator(mode="after")
+    def validate_runtime_profile_references(self) -> Settings:
+        for app_name, app in self.apps.items():
+            for environment_name, environment in app.environments.items():
+                profile = environment.runtime_profile
+                if profile is not None and profile not in self.runtime_profiles:
+                    raise ValueError(
+                        f"apps.{app_name}.environments.{environment_name}.runtime_profile is not registered"
+                    )
+        return self
 
     @field_validator("allowed_client_cidrs")
     @classmethod
