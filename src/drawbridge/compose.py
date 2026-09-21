@@ -42,11 +42,26 @@ class _AllowedHostMount:
 
 
 @dataclass(frozen=True)
+class _PublishedPort:
+    host_ip: str
+    published: int
+    target: int
+    protocol: str
+
+
+@dataclass(frozen=True)
+class _DeviceReservation:
+    driver: str
+    device_ids: tuple[str, ...]
+    capabilities: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _RuntimePolicy:
     privileged_services: frozenset[str]
     host_mounts: tuple[_AllowedHostMount, ...]
-    ports: dict[str, frozenset[tuple[str, int, int, str]]]
-    device_reservations: dict[str, tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]]
+    ports: dict[str, frozenset[_PublishedPort]]
+    device_reservations: dict[str, tuple[_DeviceReservation, ...]]
 
 
 _ALLOWED_SERVICE_KEYS = {
@@ -285,7 +300,7 @@ def _normalize_runtime_profile(value: Mapping[str, Any]) -> _RuntimePolicy:
     port_values = value.get("ports", {})
     if not isinstance(port_values, Mapping):
         raise ComposeError("runtime profile ports must be a service mapping")
-    ports: dict[str, frozenset[tuple[str, int, int, str]]] = {}
+    ports: dict[str, frozenset[_PublishedPort]] = {}
     for service, entries in port_values.items():
         if not isinstance(service, str) or not isinstance(entries, list):
             raise ComposeError("runtime profile ports must map service names to lists")
@@ -294,7 +309,7 @@ def _normalize_runtime_profile(value: Mapping[str, Any]) -> _RuntimePolicy:
     device_values = value.get("device_reservations", {})
     if not isinstance(device_values, Mapping):
         raise ComposeError("runtime profile device_reservations must be a service mapping")
-    device_reservations: dict[str, tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]] = {}
+    device_reservations: dict[str, tuple[_DeviceReservation, ...]] = {}
     for service, entries in device_values.items():
         if not isinstance(service, str) or not isinstance(entries, list):
             raise ComposeError("runtime profile device_reservations must map service names to lists")
@@ -363,7 +378,7 @@ def _validate_service_capabilities(name: str, service: Mapping[str, Any], policy
         _validate_deploy(name, service["deploy"], policy)
 
 
-def _normalize_published_port(value: Any, description: str) -> tuple[str, int, int, str]:
+def _normalize_published_port(value: Any, description: str) -> _PublishedPort:
     if not isinstance(value, str):
         raise ComposeError(f"published port in {description} must use short string syntax")
     port_value, separator, protocol = value.partition("/")
@@ -389,7 +404,7 @@ def _normalize_published_port(value: Any, description: str) -> tuple[str, int, i
         raise ComposeError(f"published port in {description} must use integer ports") from exc
     if not 1 <= published <= 65535 or not 1 <= target <= 65535:
         raise ComposeError(f"published port in {description} is outside the valid range")
-    return host_ip, published, target, protocol
+    return _PublishedPort(host_ip=host_ip, published=published, target=target, protocol=protocol)
 
 
 def _validate_deploy(name: str, value: Any, policy: _RuntimePolicy) -> None:
@@ -412,7 +427,7 @@ def _validate_deploy(name: str, value: Any, policy: _RuntimePolicy) -> None:
         raise ComposeError(f"service {name} device reservations do not match its runtime profile")
 
 
-def _normalize_device_reservation(value: Any, description: str) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+def _normalize_device_reservation(value: Any, description: str) -> _DeviceReservation:
     if not isinstance(value, Mapping) or set(value) != {"driver", "device_ids", "capabilities"}:
         raise ComposeError(f"device reservation in {description} must use exact registered fields")
     driver = value["driver"]
@@ -427,7 +442,7 @@ def _normalize_device_reservation(value: Any, description: str) -> tuple[str, tu
         or not all(isinstance(item, str) for item in capabilities)
     ):
         raise ComposeError(f"device reservation in {description} has invalid types")
-    return driver, tuple(device_ids), tuple(capabilities)
+    return _DeviceReservation(driver=driver, device_ids=tuple(device_ids), capabilities=tuple(capabilities))
 
 
 def _walk_strings(value: Any) -> Iterator[str]:
@@ -590,7 +605,7 @@ def _validate_volume_source(
     _reject_parent_segments(source_path, f"volume source in {service_name}")
     if source_path.is_absolute():
         normalized = _normalize_host_path(source_path, f"volume source in {service_name}")
-        _require_registered_data_mount(
+        _require_registered_mount(
             service_name=service_name,
             source=normalized,
             target=target,
@@ -614,7 +629,7 @@ def _validate_volume_source(
         normalized.relative_to(project_dir)
     except ValueError as exc:
         raise ComposeError(f"volume source is outside the project in {service_name}") from exc
-    _require_registered_data_mount(
+    _require_registered_mount(
         service_name=service_name,
         source=normalized,
         target=target,
@@ -625,7 +640,7 @@ def _validate_volume_source(
     )
 
 
-def _require_registered_data_mount(
+def _require_registered_mount(
     *,
     service_name: str,
     source: Path,
