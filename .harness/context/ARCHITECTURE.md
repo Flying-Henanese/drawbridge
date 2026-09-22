@@ -60,14 +60,18 @@ Docker 发现和日志读取也在 Gateway 中调用 Docker。Runner 负责队�
    项目内的 Compose 文件和已登记的构建 profile。服务端拒绝符号链接路径、无效 Git
    origin、不支持的 Compose 特权键和未登记的构建选项。注册成功才会保存应用绑定。
 2. **计划**：`ops_release_plan` 在绑定的仓库中以 `fetch` 或 `local` 模式解析完整 Git ref
-   或允许的 SHA，冻结 commit、服务集合、绑定版本、构建 profile 摘要和当前发布基线。
-   计划有 15 分钟有效期；这里不构建或部署。
+   或允许的 SHA，从该 SHA 的 archive 创建临时快照，应用显式选择的 workspace revision，
+   再校验 Compose、build 声明和固定服务集合。计划冻结规范化 Compose/build/revision 指纹、
+   binding 配置白名单摘要、完整 build profile 摘要和当前发布基线。计划有 15 分钟有效期；
+   临时快照在返回前清理，这里不构建或部署。
 3. **排队**：`ops_release_apply(plan_id, idempotency_key)` 检查计划及基线，将部署任务写入
    SQLite，返回 `job_id`。当前配置将同时运行的变更任务限定为一个。工具结果中的
    `status: ok` 只表示已接受；客户端需轮询
    `ops_release_status(job_id)` 才能知道任务结果。
-4. **执行**：Runner 从队列认领任务，按冻结 SHA 用 `git archive` 创建发布快照，应用
-   可选的已登记 workspace revision，再从快照重新校验 Compose。
+4. **执行**：Runner 从队列认领任务，先复验 plan schema、binding 配置、build profile 和
+   当前基线，再按冻结 SHA 用 `git archive` 创建发布快照并应用显式 revision。Runner 使用
+   与计划阶段相同的原语重新计算全部快照指纹；任一字段不一致都在构建、Compose 或 simulation
+   release 写入前以 `STALE_PLAN` 终止。
 5. **构建与部署**：simulation 只写发布证据。Docker 模式对 `build:` 服务调用固定的
    BuildKit profile，导出 Docker archive，导入 Docker Engine，查验镜像 ID，生成引用
    镜像 ID 的运行时 Compose，然后执行带 `--detach`、`--no-build`、`--pull never` 和

@@ -382,3 +382,20 @@ Compose 项目 `drawbridge-contractlens-trusted-staging` 的三个容器均为 `
 `GET /openapi.json` 200，受限 HTTP 请求也返回 200。服务器配置修改前的备份位于
 `/home/mineru_dev/.config/drawbridge/config.yaml.pre-trusted-20260922T110208`；拉取前的远端
 Drawbridge 修改保留在 `stash@{0}`，原有 `.pre-*` 文件未删除。
+
+## 21. 任务 02 冻结 SHA 计划指纹本地验证（2026-09-22）
+
+任务 02 将计划阶段与 Runner 阶段统一为同一个快照准备原语：从计划解析出的完整 commit SHA
+执行 `git archive`，应用显式 workspace revision，再校验 Compose、build 声明和固定服务集合。
+版本化 plan 保存规范化的 Compose、build 声明、revision、binding 配置和完整 build profile
+摘要；apply 与 Runner 都拒绝旧 schema，Runner 在任何构建、Docker 或 simulation release
+副作用前重新计算并逐项比较指纹。
+
+本地 macOS arm64、Python 3.14.5 先运行 `tests/test_service.py` 聚焦测试，结果为
+**25 passed**。完整执行 `uv sync --frozen --extra dev` 和
+`.venv/bin/python scripts/verify.py`，报告位于
+`var/verification/20260922T052709Z/report.json`，`result: passed`；Ruff、格式、mypy、编译、
+67 个 pytest、隔离 self-check 与 simulation 全部通过。测试覆盖分支前进和未提交工作区不影响
+旧计划、服务拓扑在计划阶段拒绝、workspace revision 在解析前应用、旧 plan schema 拒绝、
+各快照指纹篡改、无 build 服务时 profile 变化、binding 配置变化，以及注释、空白和 mapping
+键顺序不影响 Compose 摘要。本地结果没有覆盖真实 Docker/BuildKit；t4 验证另行记录。
