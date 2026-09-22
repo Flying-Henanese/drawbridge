@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -70,6 +72,7 @@ class GatewayAccessMiddleware(BaseHTTPMiddleware):
 
 def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path) -> FastMCP:
     backend = service
+
     # FastMCP enables localhost-only DNS rebinding protection when constructed
     # with its default host. Keep that protection enabled, but derive the SDK's
     # Host allowlist from the same administrator-controlled values as the
@@ -89,15 +92,11 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         ),
     )
 
-    async def ready() -> None:
-        await backend.database.initialize()
-
     @mcp.tool(
         name="ops_catalog",
         description="Start here. Lists available operations, access levels, deployment workflow, and runtime limits.",
     )
     async def ops_catalog() -> dict[str, Any]:
-        await ready()
         return await backend.catalog()
 
     @mcp.tool(
@@ -108,7 +107,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         ),
     )
     async def ops_status(app: str | None = None, environment: str = "staging") -> dict[str, Any]:
-        await ready()
         return await backend.status(app=app, environment=environment)
 
     @mcp.tool(
@@ -128,7 +126,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         limit: int = 100,
         tail: int = 200,
     ) -> dict[str, Any]:
-        await ready()
         request = LogsInput(
             app=app,
             environment=cast(Literal["staging"], environment),
@@ -149,7 +146,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         ),
     )
     async def ops_app_discover(limit: int = 100, cursor: str = "") -> dict[str, Any]:
-        await ready()
         return await backend.app_discover(limit=limit, cursor=cursor)
 
     @mcp.tool(
@@ -167,7 +163,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         environment: str = "staging",
         profile: str = "default",
     ) -> dict[str, Any]:
-        await ready()
         return await backend.app_register(
             app=app,
             environment=environment,
@@ -179,7 +174,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
 
     @mcp.tool(name="ops_git_status", description="Read Git status for a registered app's source repository.")
     async def ops_git_status(app: str, environment: str = "staging") -> dict[str, Any]:
-        await ready()
         return await backend.git_status(app=app, environment=environment)
 
     @mcp.tool(
@@ -195,12 +189,10 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         environment: str = "staging",
         count: int = 20,
     ) -> dict[str, Any]:
-        await ready()
         return await backend.git_log(app=app, environment=environment, git_ref=git_ref, count=count)
 
     @mcp.tool(name="ops_process_list", description="Read a bounded host process summary.")
     async def ops_process_list() -> dict[str, Any]:
-        await ready()
         return await backend.process_list()
 
     @mcp.tool(
@@ -216,7 +208,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         environment: str = "staging",
         release_id: str | None = None,
     ) -> dict[str, Any]:
-        await ready()
         return await backend.config_read(
             app=app,
             environment=environment,
@@ -237,7 +228,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         environment: str = "staging",
         release_id: str | None = None,
     ) -> dict[str, Any]:
-        await ready()
         return await backend.config_validate(
             app=app,
             environment=environment,
@@ -260,7 +250,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         workspace_revision: str | None = None,
         workflow: str = "deploy_basic",
     ) -> dict[str, Any]:
-        await ready()
         return await backend.release_plan(
             app=app,
             environment=environment,
@@ -278,7 +267,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         ),
     )
     async def ops_release_apply(plan_id: str, idempotency_key: str) -> dict[str, Any]:
-        await ready()
         return await backend.release_apply(plan_id=plan_id, idempotency_key=idempotency_key)
 
     @mcp.tool(
@@ -289,7 +277,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         ),
     )
     async def ops_release_status(job_id: str) -> dict[str, Any]:
-        await ready()
         return await backend.release_status(job_id)
 
     @mcp.tool(
@@ -306,7 +293,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         idempotency_key: str,
         environment: str = "staging",
     ) -> dict[str, Any]:
-        await ready()
         return await backend.release_rollback(
             app=app,
             environment=environment,
@@ -329,7 +315,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         idempotency_key: str,
         environment: str = "staging",
     ) -> dict[str, Any]:
-        await ready()
         return await backend.service_restart(
             app=app,
             environment=environment,
@@ -354,7 +339,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         environment: str = "staging",
         base_commit_sha: str | None = None,
     ) -> dict[str, Any]:
-        await ready()
         return await backend.workspace_patch(
             app=app,
             environment=environment,
@@ -384,7 +368,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         idempotency_key: str | None = None,
         environment: str = "staging",
     ) -> dict[str, Any]:
-        await ready()
         request = HttpRequestInput(
             url=url,
             method=cast(Literal["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], method),
@@ -413,7 +396,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         environment: str = "staging",
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        await ready()
         values = parameters or {}
         if operation == "service_restart":
             if not idempotency_key:
@@ -480,7 +462,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
         plan_id: str,
         idempotency_key: str,
     ) -> dict[str, Any]:
-        await ready()
         if workflow not in {"deploy_basic", "deploy_verify"}:
             return {
                 "status": "error",
@@ -496,7 +477,6 @@ def build_mcp(service: DrawbridgeService, settings: Settings, *, base_dir: Path)
 
     @mcp.resource("drawbridge://apps", description="Application names defined in the administrator configuration.")
     async def apps() -> str:
-        await ready()
         bindings = []
         for app in settings.apps:
             bindings.append(app)
@@ -512,6 +492,18 @@ def create_app(config_path: Path) -> Any:
     service = DrawbridgeService(settings, database, base_dir=base_dir)
     mcp = build_mcp(service, settings, base_dir=base_dir)
     app = mcp.streamable_http_app()
+    session_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(application: Any) -> AsyncIterator[Any]:
+        await database.initialize()
+        try:
+            async with session_lifespan(application) as state:
+                yield state
+        finally:
+            await database.close()
+
+    app.router.lifespan_context = lifespan
     app.add_middleware(GatewayAccessMiddleware, settings=settings, base_dir=base_dir)
     return app
 

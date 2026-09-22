@@ -90,6 +90,9 @@ Gateway 与 Runner **不通过 HTTP 互相调用**。Gateway 将部署、回滚�
    `concurrency.queue_timeout_seconds` 后会过期；默认等待上限为 600 秒。
    `apply` 的 `status: ok` 仅表示请求已接受，最终结果以 job 状态为准。
 
+Gateway 在进程启动时初始化一次数据库 schema；并发 MCP 请求不会重复执行初始化。单个
+进程内的 SQLite API 使用短事务串行化，Gateway 与 Runner 的独立连接再由 WAL 写锁协调。
+
 推荐使用两份配置，以便仅 Gateway 读取 bearer token：
 
 - `/etc/drawbridge/gateway.yaml`：`auth.mode: token`，用 `auth.token_file` 指向仅

@@ -888,17 +888,21 @@ class DrawbridgeService:
         if job is None:
             return None
         try:
+            completed_in_handler = False
             if job.action == "deploy":
                 result = await self._execute_deploy(job)
+                completed_in_handler = True
             elif job.action == "rollback":
                 result = await self._execute_rollback(job)
+                completed_in_handler = True
             elif job.action == "restart":
                 result = await self._execute_restart(job)
             elif job.action == "http_request":
                 result = await self._execute_http_job(job)
             else:
                 raise DrawbridgeError("UNKNOWN_OPERATION", f"unsupported queued action: {job.action}")
-            await self.database.finish_job(job.job_id, status="succeeded", result=result)
+            if not completed_in_handler:
+                await self.database.finish_job(job.job_id, status="succeeded", result=result)
         except DrawbridgeError as exc:
             await self.database.finish_job(
                 job.job_id,
@@ -971,21 +975,17 @@ class DrawbridgeService:
                     retryable=exc.retryable,
                 ) from exc
             raise
-        await self.database.save_release(
-            release_id=release_id,
-            app=plan["app"],
-            environment=plan["environment"],
-            payload=release_payload,
-        )
-        await self.database.append_event(
-            "release_succeeded",
-            release_payload,
+        result = {"release_id": release_id, "status": "succeeded", **release_payload}
+        await self.database.complete_job_with_release(
             job_id=job.job_id,
+            result=result,
+            release_id=release_id,
             app=plan["app"],
             environment=plan["environment"],
-            release_id=release_id,
+            release_payload=release_payload,
+            event_type="release_succeeded",
         )
-        return {"release_id": release_id, "status": "succeeded", **release_payload}
+        return result
 
     async def _prepare_snapshot(
         self,
@@ -1161,20 +1161,23 @@ class DrawbridgeService:
         else:
             raise DrawbridgeError("ROLLBACK_PRECHECK_FAILED", "docker rollback requires a retained runtime template")
         payload.pop("created_at", None)
-        await self.database.save_release(
-            release_id=release_id,
-            app=job.app or "",
-            environment=job.environment or "staging",
-            payload=payload,
-            replaces_release_id=current["release_id"],
-            restored_from_release_id=target["release_id"],
-        )
-        return {
+        result = {
             "release_id": release_id,
             "status": "succeeded",
             "restored_from_release_id": target["release_id"],
             "replaces_release_id": current["release_id"],
         }
+        await self.database.complete_job_with_release(
+            job_id=job.job_id,
+            result=result,
+            release_id=release_id,
+            app=job.app or "",
+            environment=job.environment or "staging",
+            release_payload=payload,
+            replaces_release_id=current["release_id"],
+            restored_from_release_id=target["release_id"],
+        )
+        return result
 
     async def _execute_restart(self, job: JobRecord) -> dict[str, Any]:
         binding = await self._require_binding(job.app or "", job.environment or "staging")

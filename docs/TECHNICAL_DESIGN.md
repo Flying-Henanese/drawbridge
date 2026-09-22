@@ -916,11 +916,17 @@ synchronous=FULL。Gateway 与 Runner 各有独立连接；数据库事务只覆
 读写并行；数据库放本地文件系统，不放 NFS 等网络盘。参见
 [SQLite WAL 文档](https://www.sqlite.org/wal.html)。
 
+每个进程内的 `Database` 实例以一个 asyncio 锁保护共享 aiosqlite 连接的全部 API，避免
+不同协程交叉提交或回滚同一连接。多语句写操作从 `BEGIN IMMEDIATE` 到 commit/rollback
+全程持锁；不同进程仍由 SQLite 写锁和 busy timeout 串行化。Gateway 在 ASGI 应用启动时
+执行一次 schema 初始化，关闭时释放连接，不在 MCP 工具调用中重复执行 `executescript()`。
+
 单 Runner 启动时持有全局 flock，防止重复实例；应用、仓库和设备锁分两层实现：
 进程内按目标使用 asyncio.Lock 互斥同一 Runner 中的多个 job，文件锁只做跨进程保护
 并以 LOCK_NB 非阻塞获取，避免阻塞 flock 卡住事件循环。
 job 认领使用短 BEGIN IMMEDIATE 事务，将 Queued 条件更新为 Running 并写 owner；
 同一事务保存幂等键和 job，唯一约束防止重复创建。心跳用于诊断，不实现分布式租约。
+成功发布时，release、成功事件和 job 终态在同一事务提交，避免只保存其中一部分。
 锁目录独立且固定，不删除使用中的锁文件。Runner 异常退出后锁会释放，但恢复仍必须
 核实遗留子进程和容器状态，锁释放不等于旧任务已经停止。
 

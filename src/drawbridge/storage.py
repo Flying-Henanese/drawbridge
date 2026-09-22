@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -187,17 +190,25 @@ class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._connection: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
+        self._initialized = False
 
     async def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = await self._get_connection()
-        await connection.executescript(SCHEMA)
-        await connection.commit()
+        async with self._lock:
+            if self._initialized:
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            connection = await self._get_connection()
+            await connection.executescript(SCHEMA)
+            await connection.commit()
+            self._initialized = True
 
     async def close(self) -> None:
-        if self._connection is not None:
-            await self._connection.close()
-            self._connection = None
+        async with self._lock:
+            if self._connection is not None:
+                await self._connection.close()
+                self._connection = None
+            self._initialized = False
 
     async def _get_connection(self) -> aiosqlite.Connection:
         if self._connection is None:
@@ -206,6 +217,26 @@ class Database:
             await self._connection.execute("PRAGMA foreign_keys = ON")
             await self._connection.execute("PRAGMA busy_timeout = 5000")
         return self._connection
+
+    @asynccontextmanager
+    async def _locked_connection(self) -> AsyncIterator[aiosqlite.Connection]:
+        async with self._lock:
+            yield await self._get_connection()
+
+    @asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+        async with self._lock:
+            connection = await self._get_connection()
+            started = False
+            try:
+                await connection.execute("BEGIN IMMEDIATE")
+                started = True
+                yield connection
+                await connection.commit()
+            except BaseException:
+                if started:
+                    await connection.rollback()
+                raise
 
     @staticmethod
     async def _fetchone(
@@ -231,9 +262,7 @@ class Database:
         queue_timeout_seconds: int = 600,
         plan_id: str | None = None,
     ) -> EnqueueResult:
-        connection = await self._get_connection()
-        await connection.execute("BEGIN IMMEDIATE")
-        try:
+        async with self._transaction() as connection:
             existing = await self._fetchone(
                 connection,
                 "SELECT job_id, request_hash FROM idempotency_keys WHERE idempotency_key = ?",
@@ -242,7 +271,6 @@ class Database:
             if existing is not None:
                 if existing["request_hash"] != request_hash:
                     raise IdempotencyConflict("idempotency key is bound to a different request")
-                await connection.commit()
                 return EnqueueResult(job_id=existing["job_id"], created=False)
 
             if plan_id is not None:
@@ -260,7 +288,6 @@ class Database:
                             time.time(),
                         ),
                     )
-                    await connection.commit()
                     return EnqueueResult(job_id=existing_plan_job["job_id"], created=False)
 
             queued = await self._fetchone(connection, "SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'")
@@ -301,16 +328,10 @@ class Database:
                 "INSERT INTO idempotency_keys VALUES (?, ?, ?, ?, ?)",
                 (idempotency_key, action, request_hash, job_id, now),
             )
-            await connection.commit()
             return EnqueueResult(job_id=job_id, created=True)
-        except Exception:
-            await connection.rollback()
-            raise
 
     async def claim_next_job(self, *, owner: str, max_running_jobs: int = 1) -> JobRecord | None:
-        connection = await self._get_connection()
-        await connection.execute("BEGIN IMMEDIATE")
-        try:
+        async with self._transaction() as connection:
             now = time.time()
             running = await self._fetchone(
                 connection,
@@ -318,7 +339,6 @@ class Database:
             )
             assert running is not None
             if running["count"] >= max_running_jobs:
-                await connection.commit()
                 return None
             while True:
                 row = await self._fetchone(
@@ -326,7 +346,6 @@ class Database:
                     "SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1",
                 )
                 if row is None:
-                    await connection.commit()
                     return None
                 if row["queued_until"] <= now:
                     await connection.execute(
@@ -338,67 +357,123 @@ class Database:
                         ),
                     )
                     continue
-                await connection.execute(
-                    "UPDATE jobs SET status = 'running', owner = ?, started_at = ?, heartbeat_at = ? WHERE job_id = ?",
+                cursor = await connection.execute(
+                    "UPDATE jobs SET status = 'running', owner = ?, started_at = ?, heartbeat_at = ? "
+                    "WHERE job_id = ? AND status = 'queued'",
                     (owner, now, now, row["job_id"]),
                 )
+                try:
+                    claimed_count = cursor.rowcount
+                finally:
+                    await cursor.close()
+                if claimed_count != 1:
+                    continue
                 claimed = await self._fetchone(connection, "SELECT * FROM jobs WHERE job_id = ?", (row["job_id"],))
                 assert claimed is not None
-                await connection.commit()
                 return JobRecord.from_row(claimed)
-        except Exception:
-            await connection.rollback()
-            raise
 
     async def get_job(self, job_id: str) -> JobRecord | None:
-        connection = await self._get_connection()
-        row = await self._fetchone(connection, "SELECT * FROM jobs WHERE job_id = ?", (job_id,))
+        async with self._locked_connection() as connection:
+            row = await self._fetchone(connection, "SELECT * FROM jobs WHERE job_id = ?", (job_id,))
         return JobRecord.from_row(row) if row else None
 
     async def get_job_by_plan(self, plan_id: str) -> JobRecord | None:
-        connection = await self._get_connection()
-        row = await self._fetchone(connection, "SELECT * FROM jobs WHERE plan_id = ?", (plan_id,))
+        async with self._locked_connection() as connection:
+            row = await self._fetchone(connection, "SELECT * FROM jobs WHERE plan_id = ?", (plan_id,))
         return JobRecord.from_row(row) if row else None
 
     async def finish_job(self, job_id: str, *, status: str, result: dict[str, Any]) -> None:
-        connection = await self._get_connection()
-        now = time.time()
-        await connection.execute(
-            "UPDATE jobs SET status = ?, finished_at = ?, heartbeat_at = ?, result = ? WHERE job_id = ?",
-            (status, now, now, json.dumps(result, sort_keys=True, ensure_ascii=False), job_id),
-        )
-        await connection.commit()
+        async with self._transaction() as connection:
+            now = time.time()
+            await connection.execute(
+                "UPDATE jobs SET status = ?, finished_at = ?, heartbeat_at = ?, result = ? WHERE job_id = ?",
+                (status, now, now, json.dumps(result, sort_keys=True, ensure_ascii=False), job_id),
+            )
+
+    async def complete_job_with_release(
+        self,
+        *,
+        job_id: str,
+        result: dict[str, Any],
+        release_id: str,
+        app: str,
+        environment: str,
+        release_payload: dict[str, Any],
+        release_status: str = "succeeded",
+        replaces_release_id: str | None = None,
+        restored_from_release_id: str | None = None,
+        event_type: str | None = None,
+    ) -> None:
+        async with self._transaction() as connection:
+            now = time.time()
+            await connection.execute(
+                "INSERT INTO releases VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    release_id,
+                    app,
+                    environment,
+                    release_status,
+                    json.dumps(release_payload, sort_keys=True),
+                    now,
+                    replaces_release_id,
+                    restored_from_release_id,
+                ),
+            )
+            if event_type is not None:
+                await connection.execute(
+                    "INSERT INTO events(event_id, created_at, request_id, event_type, app, environment, "
+                    "job_id, plan_id, release_id, payload) VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?)",
+                    (
+                        str(uuid.uuid4()),
+                        now,
+                        event_type,
+                        app,
+                        environment,
+                        job_id,
+                        release_id,
+                        json.dumps(release_payload, sort_keys=True),
+                    ),
+                )
+            cursor = await connection.execute(
+                "UPDATE jobs SET status = 'succeeded', finished_at = ?, heartbeat_at = ?, result = ? "
+                "WHERE job_id = ? AND status = 'running'",
+                (now, now, json.dumps(result, sort_keys=True, ensure_ascii=False), job_id),
+            )
+            try:
+                completed_count = cursor.rowcount
+            finally:
+                await cursor.close()
+            if completed_count != 1:
+                raise StorageError("release completion requires exactly one running job")
 
     async def heartbeat(self, job_id: str) -> None:
-        connection = await self._get_connection()
-        await connection.execute("UPDATE jobs SET heartbeat_at = ? WHERE job_id = ?", (time.time(), job_id))
-        await connection.commit()
+        async with self._transaction() as connection:
+            await connection.execute("UPDATE jobs SET heartbeat_at = ? WHERE job_id = ?", (time.time(), job_id))
 
     async def save_binding(self, app: str, environment: str, payload: dict[str, Any], *, status: str) -> int:
-        connection = await self._get_connection()
-        existing = await self._fetchone(
-            connection,
-            "SELECT version FROM app_bindings WHERE app = ? AND environment = ?",
-            (app, environment),
-        )
-        version = (existing["version"] + 1) if existing else 1
-        await connection.execute(
-            """INSERT INTO app_bindings(app, environment, version, status, payload, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(app, environment) DO UPDATE SET version=excluded.version,
-                   status=excluded.status, payload=excluded.payload, created_at=excluded.created_at""",
-            (app, environment, version, status, json.dumps(payload, sort_keys=True), time.time()),
-        )
-        await connection.commit()
-        return version
+        async with self._transaction() as connection:
+            existing = await self._fetchone(
+                connection,
+                "SELECT version FROM app_bindings WHERE app = ? AND environment = ?",
+                (app, environment),
+            )
+            version = (existing["version"] + 1) if existing else 1
+            await connection.execute(
+                """INSERT INTO app_bindings(app, environment, version, status, payload, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(app, environment) DO UPDATE SET version=excluded.version,
+                       status=excluded.status, payload=excluded.payload, created_at=excluded.created_at""",
+                (app, environment, version, status, json.dumps(payload, sort_keys=True), time.time()),
+            )
+            return version
 
     async def get_binding(self, app: str, environment: str) -> dict[str, Any] | None:
-        connection = await self._get_connection()
-        row = await self._fetchone(
-            connection,
-            "SELECT * FROM app_bindings WHERE app = ? AND environment = ?",
-            (app, environment),
-        )
+        async with self._locked_connection() as connection:
+            row = await self._fetchone(
+                connection,
+                "SELECT * FROM app_bindings WHERE app = ? AND environment = ?",
+                (app, environment),
+            )
         if row is None:
             return None
         payload = json.loads(row["payload"])
@@ -415,23 +490,22 @@ class Database:
         payload: dict[str, Any],
         expires_at: float,
     ) -> None:
-        connection = await self._get_connection()
-        await connection.execute(
-            "INSERT INTO plans VALUES (?, ?, ?, 'planned', ?, ?, ?)",
-            (
-                plan_id,
-                app,
-                environment,
-                json.dumps(payload, sort_keys=True),
-                time.time(),
-                expires_at,
-            ),
-        )
-        await connection.commit()
+        async with self._transaction() as connection:
+            await connection.execute(
+                "INSERT INTO plans VALUES (?, ?, ?, 'planned', ?, ?, ?)",
+                (
+                    plan_id,
+                    app,
+                    environment,
+                    json.dumps(payload, sort_keys=True),
+                    time.time(),
+                    expires_at,
+                ),
+            )
 
     async def get_plan(self, plan_id: str) -> dict[str, Any] | None:
-        connection = await self._get_connection()
-        row = await self._fetchone(connection, "SELECT * FROM plans WHERE plan_id = ?", (plan_id,))
+        async with self._locked_connection() as connection:
+            row = await self._fetchone(connection, "SELECT * FROM plans WHERE plan_id = ?", (plan_id,))
         if row is None:
             return None
         payload = json.loads(row["payload"])
@@ -448,9 +522,8 @@ class Database:
         return cast(dict[str, Any], payload)
 
     async def mark_plan(self, plan_id: str, status: str) -> None:
-        connection = await self._get_connection()
-        await connection.execute("UPDATE plans SET status = ? WHERE plan_id = ?", (status, plan_id))
-        await connection.commit()
+        async with self._transaction() as connection:
+            await connection.execute("UPDATE plans SET status = ? WHERE plan_id = ?", (status, plan_id))
 
     async def save_revision(
         self,
@@ -461,25 +534,24 @@ class Database:
         base_commit_sha: str,
         payload: dict[str, Any],
     ) -> None:
-        connection = await self._get_connection()
-        await connection.execute(
-            "INSERT INTO workspace_revisions VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                revision_id,
-                app,
-                environment,
-                base_commit_sha,
-                json.dumps(payload, sort_keys=True),
-                time.time(),
-            ),
-        )
-        await connection.commit()
+        async with self._transaction() as connection:
+            await connection.execute(
+                "INSERT INTO workspace_revisions VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    revision_id,
+                    app,
+                    environment,
+                    base_commit_sha,
+                    json.dumps(payload, sort_keys=True),
+                    time.time(),
+                ),
+            )
 
     async def get_revision(self, revision_id: str) -> dict[str, Any] | None:
-        connection = await self._get_connection()
-        row = await self._fetchone(
-            connection, "SELECT * FROM workspace_revisions WHERE revision_id = ?", (revision_id,)
-        )
+        async with self._locked_connection() as connection:
+            row = await self._fetchone(
+                connection, "SELECT * FROM workspace_revisions WHERE revision_id = ?", (revision_id,)
+            )
         if row is None:
             return None
         payload = json.loads(row["payload"])
@@ -505,44 +577,47 @@ class Database:
         replaces_release_id: str | None = None,
         restored_from_release_id: str | None = None,
     ) -> None:
-        connection = await self._get_connection()
-        await connection.execute(
-            "INSERT INTO releases VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                release_id,
-                app,
-                environment,
-                status,
-                json.dumps(payload, sort_keys=True),
-                time.time(),
-                replaces_release_id,
-                restored_from_release_id,
-            ),
-        )
-        await connection.commit()
+        async with self._transaction() as connection:
+            await connection.execute(
+                "INSERT INTO releases VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    release_id,
+                    app,
+                    environment,
+                    status,
+                    json.dumps(payload, sort_keys=True),
+                    time.time(),
+                    replaces_release_id,
+                    restored_from_release_id,
+                ),
+            )
 
     async def get_release(self, release_id: str) -> dict[str, Any] | None:
-        connection = await self._get_connection()
-        row = await self._fetchone(connection, "SELECT * FROM releases WHERE release_id = ?", (release_id,))
+        async with self._locked_connection() as connection:
+            row = await self._fetchone(connection, "SELECT * FROM releases WHERE release_id = ?", (release_id,))
         return self._release_from_row(row) if row else None
 
     async def get_current_release(self, app: str, environment: str) -> dict[str, Any] | None:
-        connection = await self._get_connection()
-        row = await self._fetchone(
-            connection,
-            "SELECT * FROM releases WHERE app = ? AND environment = ? "
-            "AND status = 'succeeded' ORDER BY created_at DESC LIMIT 1",
-            (app, environment),
-        )
+        async with self._locked_connection() as connection:
+            row = await self._fetchone(
+                connection,
+                "SELECT * FROM releases WHERE app = ? AND environment = ? "
+                "AND status = 'succeeded' ORDER BY created_at DESC LIMIT 1",
+                (app, environment),
+            )
         return self._release_from_row(row) if row else None
 
     async def list_releases(self, app: str, environment: str) -> list[dict[str, Any]]:
-        connection = await self._get_connection()
-        cursor = await connection.execute(
-            "SELECT * FROM releases WHERE app = ? AND environment = ? ORDER BY created_at DESC",
-            (app, environment),
-        )
-        return [self._release_from_row(row) for row in await cursor.fetchall()]
+        async with self._locked_connection() as connection:
+            cursor = await connection.execute(
+                "SELECT * FROM releases WHERE app = ? AND environment = ? ORDER BY created_at DESC",
+                (app, environment),
+            )
+            try:
+                rows = await cursor.fetchall()
+            finally:
+                await cursor.close()
+        return [self._release_from_row(row) for row in rows]
 
     @staticmethod
     def _release_from_row(row: aiosqlite.Row) -> dict[str, Any]:
@@ -561,35 +636,33 @@ class Database:
         return cast(dict[str, Any], payload)
 
     async def set_control(self, key: str, value: Any) -> None:
-        connection = await self._get_connection()
-        await connection.execute(
-            "INSERT INTO control_state(key, value, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            (key, json.dumps(value, sort_keys=True), time.time()),
-        )
-        await connection.commit()
+        async with self._transaction() as connection:
+            await connection.execute(
+                "INSERT INTO control_state(key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (key, json.dumps(value, sort_keys=True), time.time()),
+            )
 
     async def get_control(self, key: str, default: Any = None) -> Any:
-        connection = await self._get_connection()
-        row = await self._fetchone(connection, "SELECT value FROM control_state WHERE key = ?", (key,))
+        async with self._locked_connection() as connection:
+            row = await self._fetchone(connection, "SELECT value FROM control_state WHERE key = ?", (key,))
         return json.loads(row["value"]) if row else default
 
     async def append_event(self, event_type: str, payload: dict[str, Any], **scope: str | None) -> None:
-        connection = await self._get_connection()
-        await connection.execute(
-            "INSERT INTO events(event_id, created_at, request_id, event_type, app, environment, "
-            "job_id, plan_id, release_id, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                time.time(),
-                scope.get("request_id"),
-                event_type,
-                scope.get("app"),
-                scope.get("environment"),
-                scope.get("job_id"),
-                scope.get("plan_id"),
-                scope.get("release_id"),
-                json.dumps(payload, sort_keys=True),
-            ),
-        )
-        await connection.commit()
+        async with self._transaction() as connection:
+            await connection.execute(
+                "INSERT INTO events(event_id, created_at, request_id, event_type, app, environment, "
+                "job_id, plan_id, release_id, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    time.time(),
+                    scope.get("request_id"),
+                    event_type,
+                    scope.get("app"),
+                    scope.get("environment"),
+                    scope.get("job_id"),
+                    scope.get("plan_id"),
+                    scope.get("release_id"),
+                    json.dumps(payload, sort_keys=True),
+                ),
+            )

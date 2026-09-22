@@ -42,6 +42,10 @@ Git 仓库；其镜像地址为不可用的 `example.invalid`。状态、日志�
   commit 和显式 revision。
 - 固定服务集合发生新增、删除或改名时，计划或执行明确失败。
 
+SQLite 或 Gateway 生命周期相关改动至少应覆盖：并发入队的幂等和容量边界、两个数据库实例
+竞争认领、失败事务不影响已成功请求、binding 版本递增、release 与 job 终态原子提交，以及
+并发 MCP 工具调用只在 Gateway 启动时初始化一次 schema。
+
 ## 真实服务器验收
 
 本地报告不能证明 Gateway 的网络监听、客户端直连、systemd 用户权限、rootless

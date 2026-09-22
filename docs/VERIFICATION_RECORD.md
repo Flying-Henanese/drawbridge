@@ -423,3 +423,21 @@ release，`ops_logs` 返回 API 日志，`ops_http_request` 对 OpenAPI 地址�
 `compose.yaml` 已恢复，SHA-256 仍为
 `33df309daa107f3f3378e8b67f0936a8aca00dbb25184d106be0e3d9b96c51bc`。用于推进分支的空提交只
 保留在 t4 的 ContractLens 工作树，没有推送远端；原有未跟踪备份文件未删除。
+
+## 23. 任务 03 SQLite 事务与 Gateway 初始化本地验证（2026-09-22）
+
+任务 03 为每个 `Database` 实例增加统一的异步连接锁，并让所有多语句写操作在锁内使用
+`BEGIN IMMEDIATE` 完成完整 commit/rollback。队列容量、幂等键和 job 插入保持同一事务，
+job 认领使用带 `status = 'queued'` 条件的更新；binding 版本读写也在一个事务中。成功部署或
+simulation 回滚现在把 release、可选成功事件和 job 终态一次提交。Gateway 数据库 schema
+初始化从每个 MCP 工具调用迁移到 ASGI 应用启动周期，应用关闭时释放连接。
+
+聚焦执行 `tests/test_storage.py`、`tests/test_gateway.py` 和 `tests/test_service.py`，结果为
+**42 passed**。测试覆盖不同请求并发入队、相同幂等键、同 plan 不同键、全局和目标容量竞争、
+失败事务隔离、两个 `Database` 实例竞争认领、binding 并发版本递增、release/job 原子提交，
+以及 8 个并发 MCP 工具调用只初始化一次 schema。
+
+本地 macOS arm64、Python 3.14.5 完整执行 `.venv/bin/python scripts/verify.py`，报告位于
+`var/verification/20260922T064536Z/report.json`，`result: passed`；Ruff、格式、mypy、编译、
+78 个 pytest、隔离 self-check 与 simulation 全部通过。本地结果没有覆盖 t4 上两个 systemd
+进程对同一 SQLite 文件的实际协作，服务器验证另行记录。

@@ -38,6 +38,11 @@ Docker 发现和日志读取也在 Gateway 中调用 Docker。Runner 负责队�
 构建和 Compose 更新。这与[运维文档](../../docs/OPERATIONS.md)期望的更严格进程权限分离
 有差距，部署权限应按实际调用路径核对。
 
+每个 `Database` 实例复用一条 aiosqlite 连接，并用统一的进程内异步锁保护全部数据库
+API；多语句状态转换在锁内使用短 `BEGIN IMMEDIATE` 事务。Gateway 与 Runner 的独立连接
+仍由 SQLite WAL、busy timeout 和写事务协调。Gateway 只在 ASGI 应用启动时初始化 schema，
+关闭时释放连接，不在每次 MCP 工具调用中执行初始化。
+
 ## 源码地图
 
 | 模块 | 当前职责 |
@@ -100,6 +105,9 @@ Docker 发现和日志读取也在 Gateway 中调用 Docker。Runner 负责队�
 - 计划阶段和 Runner 使用同一套快照准备与指纹计算原语。计划只能从冻结 SHA 和显式
   revision 生成；旧 schema、服务拓扑变化或任一冻结指纹不一致时必须返回 `STALE_PLAN`，
   并在 BuildKit、Docker、simulation release 等外部副作用前停止。
+- 队列容量检查、幂等键与 job 插入位于同一事务；job 认领以条件更新保证唯一。成功部署或
+  simulation 回滚的 release、成功事件和 job 终态也在一个事务提交。Git、BuildKit、Docker
+  和 HTTP 等外部操作不在 SQLite 事务中执行。
 - HTTP 检查有目标 CIDR、端口、方法及响应大小限制；读请求可直接返回，写请求入队。
   诊断输出和日志有边界与脱敏处理。
 - 本地 `config.example.yaml` 开启 simulation；真实 Docker 构建与部署需要独立的服务器
@@ -118,8 +126,6 @@ Docker 发现和日志读取也在 Gateway 中调用 Docker。Runner 负责队�
   工具会失败；需要调整调用架构后再收紧权限，而不是直接授予 Gateway 广泛 Docker 权限。
 - `self-check` 检查 BuildKit 工具和 socket 是否存在，不验证 daemon 确实以 rootless
   模式运行；该属性需要在服务器上单独确认。
-- SQLite 的关键状态转换仍需更完整的显式事务边界；Gateway 初始化仍会执行 schema 初始化。
-  这是[优化改造计划](../../docs/OPTIMIZATION_PLAN.md)中下一项任务 03 的范围。
 - Runner 中断后的租约恢复、Docker 失败后的自动回滚以及 HTTP 验证的 DNS 重绑定防护仍待
   后续任务完善。
 - t4 已验证 ContractLens 使用现有镜像的 Docker 发布和业务健康检查，但没有执行 BuildKit
