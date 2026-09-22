@@ -350,3 +350,35 @@ GPU 均被其他进程占用，VLM 启动时只剩约 0.05 GiB 可用显存，�
 57 个 pytest、隔离 self-check 与 simulation 全部通过。受控 executor 测试确认可信 Compose
 同时包含 `image` 和带 args 的 `build` 时只执行 `compose-deploy`，没有 BuildKit、镜像导入或
 镜像识别调用。本地验证没有启动 ContractLens 容器；t4 真实验证结果在部署后另行追加。
+
+## 20. 01C 的 t4 可信 Compose 与预建镜像发布验证（2026-09-22）
+
+将 Drawbridge commit `17e940d` 快进部署到 t4 的
+`/home/mineru_dev/github_repo/drawbridge`，执行远端完整 harness，报告位于
+`/home/mineru_dev/github_repo/drawbridge/var/verification/20260922T025307Z/report.json`，
+`result: passed`；Ruff、格式、mypy、编译、57 个 pytest、隔离 self-check 和 simulation
+全部通过。重启后的 `drawbridge-gateway.service` 与 `drawbridge-runner.service` 均为 active。
+
+远端新增独立的 `contractlens-trusted` 应用和同名 runtime profile，未修改原有
+`contractlens` 登记。profile 批准的 Compose SHA-256 为
+`33df309daa107f3f3378e8b67f0936a8aca00dbb25184d106be0e3d9b96c51bc`，并启用
+`prefer_prebuilt_images`。用户给出的 `/home/mineru_dev/projects/ContractLens` 解析到配置使用的
+规范目录 `/data1/zsj/projects/ContractLens`。为避开服务器上已占用的 GPU，验证分支提交
+`e62f54c4be797821947cd1fc6e02c0450a56a6a0` 将 VLM 默认 GPU 调整为 2、3，API 继续使用 4；
+该提交只存在于 t4 的 ContractLens 工作树，未推送远端。
+
+随后通过实际 MCP Gateway 完成 `ops_catalog`、`ops_app_register`、`ops_release_plan`、
+`ops_release_apply` 和 `ops_release_status`：plan
+`797ec2c0-cacd-4081-a24c-6bdf555b8907`，job
+`7e0213c0-0b3a-4b34-a69d-094288d84393`，release
+`05031d57-5a2c-428d-969f-eeec5648ab77`。job 最终为 `succeeded`，HTTP 健康检查为
+`passed`，结果中的 `built_images` 为 `{}`；三个服务分别直接使用已存在的
+`pdf-parser:cuda12.2`、PaddleOCR VLM 和 PaddleOCR API 镜像，没有执行 BuildKit 构建或镜像导入。
+运行时固定使用 `docker compose up --no-build --pull never`，因此不会隐式构建或拉取镜像。
+
+Compose 项目 `drawbridge-contractlens-trusted-staging` 的三个容器均为 `healthy`；端口
+8888、8880、8118 正常监听。通过 MCP 再执行 `ops_status`、`ops_logs` 和
+`ops_http_request`：当前 release 与上述 release ID 一致，API 日志包含应用启动完成和
+`GET /openapi.json` 200，受限 HTTP 请求也返回 200。服务器配置修改前的备份位于
+`/home/mineru_dev/.config/drawbridge/config.yaml.pre-trusted-20260922T110208`；拉取前的远端
+Drawbridge 修改保留在 `stash@{0}`，原有 `.pre-*` 文件未删除。
