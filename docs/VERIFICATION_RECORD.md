@@ -441,3 +441,20 @@ simulation 回滚现在把 release、可选成功事件和 job 终态一次提�
 `var/verification/20260922T065404Z/report.json`，`result: passed`；Ruff、格式、mypy、编译、
 78 个 pytest、隔离 self-check 与 simulation 全部通过。本地结果没有覆盖 t4 上两个 systemd
 进程对同一 SQLite 文件的实际协作，服务器验证另行记录。
+
+## 24. 任务 03 t4 服务启动与并发 MCP 验证（2026-09-22）
+
+将任务 03 提交 `a556cfb` 部署到 t4 的
+`/home/mineru_dev/github_repo/drawbridge`。远端执行 `uv sync --frozen --extra dev` 和
+`.venv/bin/python scripts/verify.py`，报告位于
+`/home/mineru_dev/github_repo/drawbridge/var/verification/20260922T065504Z/report.json`，
+`result: passed`；Python 3.12.12 下 Ruff、格式、mypy、编译、78 个 pytest、隔离 self-check
+与 simulation 全部通过。
+
+随后重启 `drawbridge-gateway.service` 和 `drawbridge-runner.service`，二者均为 `active`。
+Gateway 日志显示 ASGI application startup complete；对实际 MCP `/mcp` 同时发送 16 个只读
+`ops_catalog` 请求，16 个均返回 HTTP 200 并包含完整工具目录。此操作没有创建变更 job。
+
+ContractLens 的三个现有容器仍为 healthy。本次只重启 Drawbridge 服务并执行只读 MCP 检查，
+没有构建镜像，也没有改动 ContractLens。t4 工作树原有的 7 个未跟踪 `.pre-*` 备份文件均
+保留。
