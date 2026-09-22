@@ -50,7 +50,7 @@ class HttpVerifier:
                         truncated = True
                         break
                 content = b"".join(chunks)
-        except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
+        except (TimeoutError, httpx.TimeoutException) as exc:
             raise DrawbridgeError("TIMEOUT", "HTTP verification timed out", retryable=True) from exc
         except httpx.HTTPError as exc:
             raise DrawbridgeError("VERIFY_FAILED", f"HTTP verification failed: {exc}", retryable=True) from exc

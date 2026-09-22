@@ -7,8 +7,9 @@ Wants=network-online.target
 Type=simple
 User=drawbridge-gateway
 Group=drawbridge
+UMask=0007
 WorkingDirectory=/opt/drawbridge
-ExecStart=/opt/drawbridge/.venv/bin/drawbridge-gateway --config /etc/drawbridge/config.yaml --host 0.0.0.0 --port 8787
+ExecStart=/opt/drawbridge/.venv/bin/drawbridge-gateway --config /etc/drawbridge/gateway.yaml --host 0.0.0.0 --port 8787
 Restart=on-failure
 NoNewPrivileges=true
 ProtectHome=true
@@ -17,6 +18,9 @@ ProtectSystem=strict
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/var/lib/drawbridge
+# Fetch-mode release planning currently runs in Gateway. Add one exact
+# registered repository per line when fetch is enabled; do not grant the root.
+# ReadWritePaths=/srv/projects/example-app
 
 [Install]
 WantedBy=multi-user.target

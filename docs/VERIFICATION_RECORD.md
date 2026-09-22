@@ -458,3 +458,29 @@ Gateway 日志显示 ASGI application startup complete；对实际 MCP `/mcp` �
 ContractLens 的三个现有容器仍为 healthy。本次只重启 Drawbridge 服务并执行只读 MCP 检查，
 没有构建镜像，也没有改动 ContractLens。t4 工作树原有的 7 个未跟踪 `.pre-*` 备份文件均
 保留。
+
+## 25. Harness 与当前权限及 Python 基线对齐（本地验证，2026-09-22）
+
+本次将项目安装元数据、Ruff 和 mypy 的 Python 基线统一为 3.12，并在 `scripts/verify.py`
+增加 `runtime_metadata` 检查，防止运行时要求与开发工具配置再次漂移。切换 Ruff 目标后，
+按 Python 3.12 语义等价地改用 `datetime.UTC`、内置 `TimeoutError` 和 `StrEnum`。
+
+Harness、README、运维文档和 systemd 模板现在按当前调用路径说明权限：Gateway 负责注册、
+Git 查询和计划，`fetch` 模式需要写登记仓库；Runner 读取冻结 SHA 并负责 Docker 构建和变更。
+Gateway 没有 Docker daemon 权限时，`ops_app_discover` 和 Docker release 的 `ops_logs` 不可用。
+文档同时明确 `self-check` 不验证 Docker daemon、目标镜像、仓库属主、Git fetch 或 BuildKit
+daemon 的 rootless 属性，这些条件仍须以对应服务用户在真实服务器上单独验收。为避免共享
+BuildKit 配置要求 Gateway 访问 Runner 专属 socket，CLI 新增 `--role gateway|runner|all`：
+Gateway 角色跳过 BuildKit 检查，Runner 角色保留对应阻断项，省略参数时保持兼容的完整检查。
+systemd 模板分别读取 `gateway.yaml` 和 `runner.yaml`，两个进程使用 `drawbridge` 主组及
+`UMask=0007`；Runner 通过补充组保留 Docker 访问。状态目录须由共享组持有并启用 setgid，
+这样 Gateway 创建的 SQLite/WAL 文件才能由 Runner 继续读写。
+
+本地先执行受影响的进程、HTTP 和角色化 self-check 聚焦测试，共 **6 passed**。随后使用临时
+Python 3.12.13 环境执行完整 harness，报告位于
+`var/verification/20260922T104010Z/report.json`；再以日常 `.venv` 的 Python 3.14.5 复验，
+报告位于 `var/verification/20260922T105741Z/report.json`。两份报告均为 `result: passed`，
+Ruff、格式、mypy、编译、79 个 pytest、隔离 self-check 和 simulation 全部通过；
+`runtime_metadata` 为 `requires_python: >=3.12`、`ruff_target: py312`、
+`mypy_python_version: 3.12`。本次没有在 t4 重启服务或执行真实 Docker/BuildKit 发布；历史
+t4 证据仍是带日期的记录，不代表当前服务器就绪状态。

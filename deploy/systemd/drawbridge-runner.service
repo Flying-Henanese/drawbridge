@@ -5,11 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Replace with the ordinary owner of the registered source repository.
+# Replace with an ordinary user that can read registered repositories and
+# write the configured release roots. Git fetch currently runs in Gateway.
 User=drawbridge-runner
-Group=docker
+Group=drawbridge
+SupplementaryGroups=docker
+UMask=0007
 WorkingDirectory=/opt/drawbridge
-ExecStart=/opt/drawbridge/.venv/bin/drawbridge-runner --config /etc/drawbridge/config.yaml
+ExecStart=/opt/drawbridge/.venv/bin/drawbridge-runner --config /etc/drawbridge/runner.yaml
 Restart=on-failure
 NoNewPrivileges=true
 ProtectHome=true

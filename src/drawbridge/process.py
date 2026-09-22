@@ -5,12 +5,12 @@ import os
 import signal
 import time
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 
-class TerminationReason(str, Enum):
+class TerminationReason(StrEnum):
     EXITED = "exited"
     TIMEOUT = "timeout"
     OUTPUT_LIMIT = "output_limit"
@@ -145,7 +145,7 @@ class SafeExecutor:
         try:
             try:
                 await asyncio.wait_for(process.wait(), timeout=spec.timeout_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 await terminate(TerminationReason.TIMEOUT)
                 await process.wait()
             except asyncio.CancelledError:
@@ -187,7 +187,7 @@ class SafeExecutor:
         try:
             await asyncio.wait_for(process.wait(), timeout=self.grace_seconds)
             return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         try:
             if os.name == "posix":

@@ -35,8 +35,9 @@ Gateway 和 Runner 是两个 Python 进程，各自创建 `DrawbridgeService`，
 `state_dir/state.db` 协作，不相互发 HTTP 请求。**当前代码**在 Gateway 中直接执行
 注册、Git 查询和发布计划，因此 `fetch` 模式需要 Gateway 能写登记仓库并访问 origin；
 Docker 发现和日志读取也在 Gateway 中调用 Docker。Runner 负责队列任务、发布快照、
-构建和 Compose 更新。这与[运维文档](../../docs/OPERATIONS.md)期望的更严格进程权限分离
-有差距，部署权限应按实际调用路径核对。
+构建和 Compose 更新。当前运维配置必须按这些实际调用路径授予 Git 权限；如果 Gateway
+没有 Docker daemon 权限，则 `ops_app_discover` 和 Docker release 的 `ops_logs` 不可用。
+这仍未达到目标设计中的严格进程权限分离，后续任务 09A/09B 才会迁移这些调用。
 
 每个 `Database` 实例复用一条 aiosqlite 连接，并用统一的进程内异步锁保护全部数据库
 API；多语句状态转换在锁内使用短 `BEGIN IMMEDIATE` 事务。Gateway 与 Runner 的独立连接
@@ -124,8 +125,10 @@ API；多语句状态转换在锁内使用短 `BEGIN IMMEDIATE` 事务。Gateway
 - 当前 Gateway 会触达 Git 工作区和 Docker 只读接口；仅靠进程隔离尚不能实现设计文档
   描述的“Gateway 无 Git 凭据、无 Docker socket”目标。若按目标权限严格部署，部分
   工具会失败；需要调整调用架构后再收紧权限，而不是直接授予 Gateway 广泛 Docker 权限。
-- `self-check` 检查 BuildKit 工具和 socket 是否存在，不验证 daemon 确实以 rootless
-  模式运行；该属性需要在服务器上单独确认。
+- `self-check` 检查 Python、Git、认证、状态目录和 SQLite 阻断项；Docker 可执行文件与
+  Compose 版本只是非阻断信息，不检查 daemon 权限、镜像可用性或仓库属主。`--role runner`
+  还检查 `buildctl` 和 BuildKit socket，`--role gateway` 跳过这些 Runner 专属条件；两者都
+  不验证 daemon 确实以 rootless 模式运行。这些属性需要在服务器上以对应服务用户单独确认。
 - Runner 中断后的租约恢复、Docker 失败后的自动回滚以及 HTTP 验证的 DNS 重绑定防护仍待
   后续任务完善。
 - t4 已验证 ContractLens 使用现有镜像的 Docker 发布和业务健康检查，但没有执行 BuildKit

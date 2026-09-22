@@ -27,6 +27,9 @@
   不通过放宽 Gateway 权限掩盖架构问题。
 - `config.example.yaml` 只适合本地 simulation。服务器项目根目录、状态目录、token、
   网段、BuildKit socket 和镜像源须按环境配置；实例化后的凭据不得提交到仓库。
+- 不把 `self-check` 的成功解释为 Docker 或仓库权限验收。它不检查 Docker daemon 连接、
+  目标镜像、登记仓库属主或实际 Git fetch；服务器上须按进程传 `--role gateway` 或
+  `--role runner`，再按运维步骤以对应服务用户验证其余条件。
 
 ## 验证与记录
 

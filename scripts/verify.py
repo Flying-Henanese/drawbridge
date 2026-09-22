@@ -10,11 +10,14 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from drawbridge import MINIMUM_PYTHON
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,6 +36,22 @@ def run_step(name: str, argv: list[str], output: Path, *, env: dict[str, str] | 
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def check_runtime_metadata() -> dict[str, str]:
+    metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    requires_python = metadata["project"]["requires-python"]
+    ruff_target = metadata["tool"]["ruff"]["target-version"]
+    mypy_version = metadata["tool"]["mypy"]["python_version"]
+    baseline = f"{MINIMUM_PYTHON[0]}.{MINIMUM_PYTHON[1]}"
+    require(requires_python == f">={baseline}", "project.requires-python must match the runtime baseline")
+    require(ruff_target == f"py{baseline.replace('.', '')}", "Ruff target-version must match the runtime baseline")
+    require(mypy_version == baseline, "mypy python_version must match the runtime baseline")
+    return {
+        "requires_python": requires_python,
+        "ruff_target": ruff_target,
+        "mypy_python_version": mypy_version,
+    }
 
 
 def make_fixture(root: Path, output: Path) -> tuple[Path, Path, str]:
@@ -117,7 +136,7 @@ def check_smoke(result: dict[str, Any], root: Path, sha: str) -> dict[str, Any]:
 def verify(output: Path) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=False)
     report: dict[str, Any] = {
-        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "started_at_utc": datetime.now(UTC).isoformat(),
         "host": platform.node(),
         "platform": platform.platform(),
         "python": sys.version.split()[0],
@@ -127,6 +146,7 @@ def verify(output: Path) -> dict[str, Any]:
         "checks": {},
     }
     try:
+        report["checks"]["runtime_metadata"] = check_runtime_metadata()
         for name, argv in (
             ("ruff", [sys.executable, "-m", "ruff", "check", "src", "tests", "scripts"]),
             ("format", [sys.executable, "-m", "ruff", "format", "--check", "src", "tests", "scripts"]),
@@ -150,6 +170,8 @@ def verify(output: Path) -> dict[str, Any]:
                         "self-check",
                         "--config",
                         str(config),
+                        "--role",
+                        "all",
                     ],
                     output,
                     env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
@@ -180,7 +202,7 @@ def verify(output: Path) -> dict[str, Any]:
     except Exception as exc:
         report["error"] = str(exc)
     finally:
-        report["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+        report["finished_at_utc"] = datetime.now(UTC).isoformat()
         (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
 
@@ -189,7 +211,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, help="new evidence directory (must not exist)")
     args = parser.parse_args()
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     output = (args.output or ROOT / "var" / "verification" / timestamp).resolve()
     report = verify(output)
     print(f"{report['result']}: {output / 'report.json'}")

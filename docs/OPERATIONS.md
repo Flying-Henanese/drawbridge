@@ -21,16 +21,37 @@ uv run drawbridge-runner --config config.local.yaml
 ## 服务器安装
 
 1. 使用 Python 3.12+ 创建虚拟环境并执行 `uv sync --frozen`。
-2. 将管理员配置放到 `/etc/drawbridge/config.yaml`，token 放到权限为 0600 的文件，
-   `auth.mode` 保持 `token`。
-3. 先执行 `drawbridge self-check`；若 rootless BuildKit、Docker socket、Python 基线或
-   仓库属主不满足条件，部署能力应保持禁用，不启用高权限 fallback。
+2. 从同一份管理员部署参数生成 `/etc/drawbridge/gateway.yaml` 和
+   `/etc/drawbridge/runner.yaml`。Gateway 配置保持 `auth.mode: token`，token 放到仅 Gateway
+   用户可读、权限 0600 的文件；Runner 配置设为 `auth.mode: none` 且不配置 token，只供没有
+   网络监听端口的 Runner 使用。两份配置的状态目录、项目、构建、运行时和队列参数必须一致。
+3. 分别以对应服务用户执行完整命令：
+
+   ```sh
+   /opt/drawbridge/.venv/bin/drawbridge self-check --config /etc/drawbridge/gateway.yaml --role gateway
+   /opt/drawbridge/.venv/bin/drawbridge self-check --config /etc/drawbridge/runner.yaml --role runner
+   ```
+
+   两者会阻断 Python、Git、认证、状态目录和 SQLite 的明显错误；Runner 角色还检查已配置的
+   BuildKit 工具/socket，Gateway 角色跳过这些 Runner 专属条件。自检不检查 Docker daemon
+   权限、目标镜像、仓库属主、Git fetch 或 BuildKit daemon 是否真正 rootless；这些条件须
+   继续按下文手工验证，不启用高权限 fallback。
 4. 复制并按服务器用户修改 `deploy/systemd/*.service`，Gateway 与 Runner 使用不同的
-   systemd 用户；只有 Runner 拥有 Docker 权限。
+   systemd 用户。当前 Gateway 需要按 source mode 读取或写入登记仓库；Runner 负责 Docker
+   构建和变更。只有确实需要 `ops_app_discover` 和 Docker 日志时 Gateway 才需要 Docker
+   访问，否则这两个工具不可用。Docker socket 权限通常等同宿主机高权限，不能视为只读授权。
 5. 启动 Gateway 和 Runner 后，先调用 `ops_catalog`，再按“register → plan → apply →
-   status → logs/HTTP”顺序验证。`ops_release_apply` 只接受 plan ID，不接受命令或路径。
+   status → HTTP”顺序验证；仅在 Gateway 已有 Docker 权限时增加 `logs` 检查。
+   `ops_release_apply` 只接受 plan ID，不接受命令或路径。
    Codex CLI、Claude Code 等客户端的 SSH 隧道、token 环境变量和 MCP 配置见
    [`MCP_CLIENTS.md`](MCP_CLIENTS.md)。
+
+在真实 Docker 模式启用服务前，至少以 Runner 用户执行 `docker info`，并对目标 Compose 的
+每个 `image:` 引用执行 `docker image inspect <引用>`。以 Gateway 用户运行
+`git -C <登记仓库> rev-parse HEAD`；使用 `source_mode: fetch` 时还要验证它能访问 origin 并
+写仓库。若需要 Gateway 的发现或日志工具，再以 Gateway 用户单独验证 Docker 连接。
+Gateway systemd 模板默认只允许写状态目录；使用 fetch 时，按模板注释为每个登记仓库增加
+一条精确的 `ReadWritePaths=`，不要直接放宽 `allowed_project_roots` 的整个根目录。
 
 ## 构建镜像
 

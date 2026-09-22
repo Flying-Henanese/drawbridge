@@ -19,6 +19,7 @@ def main() -> None:
 
     check = subparsers.add_parser("self-check")
     check.add_argument("--config", type=Path, required=True)
+    check.add_argument("--role", choices=("gateway", "runner", "all"), default="all")
 
     db = subparsers.add_parser("init-db")
     db.add_argument("--config", type=Path, required=True)
@@ -31,7 +32,7 @@ def main() -> None:
     settings = load_settings(args.config)
     base_dir = args.config.parent.resolve()
     if args.command == "self-check":
-        print(json.dumps(run_self_check(settings, base_dir=base_dir), indent=2, sort_keys=True))
+        print(json.dumps(run_self_check(settings, base_dir=base_dir, role=args.role), indent=2, sort_keys=True))
         return
     if args.command == "init-db":
         database = Database(settings.resolved_state_dir(base_dir) / "state.db")

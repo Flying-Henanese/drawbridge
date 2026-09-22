@@ -60,9 +60,15 @@ docker compose version
 ```
 
 `/opt/drawbridge` 应由管理员管理，两个服务用户只需读取程序及虚拟环境。业务 Git
-仓库另放在例如 `/srv/projects/<app>`；Runner 的 `User=` 必须是该仓库的普通属主，
-Gateway 使用另一个低权限账号。业务仓库应已有 `origin` 和至少一个 commit，并能由
-Runner 用户读取和写入。**不要给 Gateway Docker socket 权限。**
+仓库另放在例如 `/srv/projects/<app>`，应已有 `origin` 和至少一个 commit。当前实现中，
+Gateway 执行注册、Git 查询和发布计划：`local` 模式需要它读取仓库，`fetch` 模式还需要
+它写入仓库并访问 origin。Runner 需要读取同一仓库，才能从计划冻结的 SHA 导出发布快照。
+
+实际镜像构建、导入和 Compose 更新只由 Runner 执行。Gateway 只有在调用
+`ops_app_discover` 或读取 Docker release 的 `ops_logs` 时才会访问 Docker；不给 Gateway
+Docker daemon 权限可以保留更小权限面，但这两个工具会不可用。Docker socket 通常等同宿主机
+高权限，不应为了启用只读工具而默认把 Gateway 加入 `docker` 组。严格的内部权限分离尚未
+完成，当前限制和后续迁移见 [.harness 当前架构](.harness/context/ARCHITECTURE.md)。
 
 ## 2. 配置与权限
 
@@ -120,9 +126,12 @@ auth:
 
 两份配置由管理员持有且服务用户只能读取；token 文件权限设为 `0600`，属主为 Gateway
 用户。Gateway 与 Runner 都要能读写同一个 SQLite 状态目录及其 WAL/SHM 文件；可用
-专用共享组、目录 `2770` 权限和两个单元中的 `UMask=0007` 实现。Runner 还需能写发布
-目录和已登记的源码仓库；如模板启用 `ProtectSystem=strict`，须把这些**准确路径**加到
-Runner 的 `ReadWritePaths=`。Gateway 不应获得这些额外写权限。
+专用共享组和目录 `2770` 权限实现；两个 systemd 模板都设 `Group=drawbridge`、
+`UMask=0007`，Runner 另通过 `SupplementaryGroups=docker` 获得 Docker 权限。状态目录应由
+`drawbridge` 组持有并启用 setgid。Runner 还需写发布目录并读取已登记的源码仓库。当前
+Gateway 在 `source_mode: fetch` 的计划路径中需要写登记仓库，所有计划都会在状态目录创建
+临时快照；如模板启用 `ProtectSystem=strict`，须按使用的 `source_mode` 把这些**准确路径**
+加入对应单元的 `ReadWritePaths=`。不要把整个 `/srv` 或用户主目录设为可写。
 
 先决定运行模式；**不要把上面的片段当作完整配置**，其余字段应从示例复制并按实际
 服务器填写：
@@ -142,9 +151,16 @@ Runner 的 `ReadWritePaths=`。Gateway 不应获得这些额外写权限。
 
 ```sh
 cd /opt/drawbridge
-.venv/bin/drawbridge self-check --config /etc/drawbridge/gateway.yaml
-.venv/bin/drawbridge self-check --config /etc/drawbridge/runner.yaml
+.venv/bin/drawbridge self-check --config /etc/drawbridge/gateway.yaml --role gateway
+.venv/bin/drawbridge self-check --config /etc/drawbridge/runner.yaml --role runner
 ```
+
+`self-check` 不连接 Docker daemon、不检查目标镜像，也不验证登记仓库的属主或 Git fetch
+权限。真实 Docker 模式还要以 Runner 用户执行 `docker info` 和逐个 `docker image inspect`，
+以 Gateway 用户验证选定的 Git source mode；只有确实要启用发现/日志工具时，才以 Gateway
+用户单独验证 Docker 连接。`--role gateway` 会跳过 Runner 专属的 BuildKit 工具和 socket
+检查；`--role runner` 会把已配置的 BuildKit 条件作为阻断项。两者都不能证明 BuildKit
+daemon 确实 rootless，真实构建仍需按运维文档验收。省略 `--role` 保留兼容行为并检查全部项目。
 
 ## 3. 安装和启动 systemd 服务
 
@@ -160,9 +176,11 @@ cd /opt/drawbridge
    地址加入 `allowed_client_cidrs`、把客户端实际使用的服务器 IP/域名加入
    `auth.allowed_hosts`。不要因为可以直连就把 `8787` 暴露到公网；跨不可信网络时应使用
    HTTPS 反向代理或 VPN。
-2. Runner 的 `User=` 改为业务仓库属主，`ExecStart` 指向 `runner.yaml`；只给 Runner
-   所需的 Docker 权限。按上节补齐两个服务的共享状态目录权限、`UMask` 和 Runner 的
-   `ReadWritePaths`。
+2. Runner 的 `User=` 改为能读取业务仓库、写发布目录且拥有所需 Docker 权限的普通用户，
+   `ExecStart` 指向 `runner.yaml`。Gateway 的 `User=` 需要按选定 source mode 获得仓库读权限
+   或 fetch 所需的写权限。按上节补齐两个服务的共享状态目录权限、`UMask` 和精确的
+   `ReadWritePaths`；Gateway 模板只注释展示单个仓库 `/srv/projects/example-app`，启用 fetch
+   时应为每个已登记仓库逐项替换或追加，不能放宽整个项目根目录。
 3. 将修改后的单元文件安装为 `/etc/systemd/system/drawbridge-gateway.service` 和
    `/etc/systemd/system/drawbridge-runner.service`，然后执行：
 
@@ -234,7 +252,7 @@ auth:
 `ops_status`、`ops_logs` 和需要的 `ops_http_request` 证据。重试同一变更时复用
 `idempotency_key`。
 初次在预克隆仓库上验证可将 `source_mode` 设为 `local`；默认的 `fetch` 还要求
-Runner 能在 systemd 的 `ProtectHome=true` 限制下访问所需 Git 凭据。
+Gateway 能在 systemd 的 `ProtectHome=true` 限制下访问所需 Git 凭据并写登记仓库。
 
 ### 已审核的 Compose 使用现有镜像启动（不构建）
 
@@ -282,9 +300,10 @@ Compose 文件摘要批准。此设置会信任该文件的完整内容，应先
    空 `--env-file`，所以不要依赖源目录 `.env` 或 systemd 环境来替换 Compose 中的 `${VAR}`；
    需要的值应在审核过的发布文件中明确提供。服务级 `env_file` 用于容器环境变量时，文件也必须
    随 Git 快照提供。
-3. 分别以 Gateway、Runner 服务用户运行 `self-check`，确认 Docker 权限和镜像可用，再重启
-   两个服务使配置生效。注册操作示例（项目目录须是 `allowed_project_roots` 下的规范绝对路径，
-   不能通过符号链接访问）：
+3. 分别以 Gateway、Runner 服务用户运行 `self-check`，再以 Runner 用户执行 `docker info`
+   并对 Compose 引用的每个镜像执行 `docker image inspect <引用>`。这些手工命令才确认
+   Docker daemon 权限和镜像可用；`self-check` 本身不检查它们。然后重启两个服务使配置生效。
+   注册操作示例（项目目录须是 `allowed_project_roots` 下的规范绝对路径，不能通过符号链接访问）：
 
    ```text
    ops_catalog()

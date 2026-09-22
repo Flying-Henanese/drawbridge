@@ -5,18 +5,24 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+from . import MINIMUM_PYTHON
 from .config import Settings
 
 
-def run_self_check(settings: Settings, *, base_dir: Path) -> dict[str, Any]:
+def run_self_check(
+    settings: Settings,
+    *,
+    base_dir: Path,
+    role: Literal["gateway", "runner", "all"] = "all",
+) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
 
     def add(name: str, ok: bool, detail: str, *, blocking: bool = False) -> None:
         checks.append({"name": name, "ok": ok, "blocking": blocking, "detail": detail})
 
-    python_ok = sys.version_info >= (3, 12)
+    python_ok = sys.version_info >= MINIMUM_PYTHON
     add("python", python_ok, ".".join(str(value) for value in sys.version_info[:3]), blocking=True)
     git = shutil.which("git")
     add("git", git is not None, git or "not found", blocking=True)
@@ -61,28 +67,30 @@ def run_self_check(settings: Settings, *, base_dir: Path) -> dict[str, Any]:
         add("http_egress_policy", True, f"{len(settings.http_verify.allowed_cidrs)} CIDR(s)")
     else:
         add("http_egress_policy", False, "no outbound CIDR is configured", blocking=False)
-    buildkit_profiles = [profile for profile in settings.build_profiles.values() if profile.mode == "buildkit"]
-    buildctl = shutil.which("buildctl")
-    add(
-        "rootless_buildkit",
-        not buildkit_profiles or buildctl is not None,
-        buildctl or "not configured",
-        blocking=bool(buildkit_profiles),
-    )
-    for name, profile in settings.build_profiles.items():
-        if profile.mode != "buildkit":
-            continue
-        address = profile.buildkit_socket or ""
-        socket = Path(address.removeprefix("unix://")) if address.startswith("unix:///") else None
-        ready = socket is not None and socket.is_socket() and not socket.is_symlink()
+    if role != "gateway":
+        buildkit_profiles = [profile for profile in settings.build_profiles.values() if profile.mode == "buildkit"]
+        buildctl = shutil.which("buildctl")
         add(
-            f"buildkit_socket_{name}",
-            ready,
-            str(socket) if socket is not None else "local Unix socket is not configured",
-            blocking=True,
+            "rootless_buildkit",
+            not buildkit_profiles or buildctl is not None,
+            buildctl or "not configured",
+            blocking=bool(buildkit_profiles),
         )
+        for name, profile in settings.build_profiles.items():
+            if profile.mode != "buildkit":
+                continue
+            address = profile.buildkit_socket or ""
+            socket = Path(address.removeprefix("unix://")) if address.startswith("unix:///") else None
+            ready = socket is not None and socket.is_socket() and not socket.is_symlink()
+            add(
+                f"buildkit_socket_{name}",
+                ready,
+                str(socket) if socket is not None else "local Unix socket is not configured",
+                blocking=True,
+            )
     return {
         "ok": all(check["ok"] for check in checks if check["blocking"]),
         "checks": checks,
-        "runtime_baseline": "Python 3.12+",
+        "role": role,
+        "runtime_baseline": f"Python {MINIMUM_PYTHON[0]}.{MINIMUM_PYTHON[1]}+",
     }

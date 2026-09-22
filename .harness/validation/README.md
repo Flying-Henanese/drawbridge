@@ -18,6 +18,7 @@ uv sync --frozen --extra dev
 
 | 步骤 | 实际执行内容 | 证据 |
 | --- | --- | --- |
+| 运行时元数据 | `requires-python`、Ruff 和 mypy 均以 Python 3.12 为基线 | `report.json` |
 | Ruff | `ruff check src tests scripts` | `ruff.log` |
 | 格式 | `ruff format --check src tests scripts` | `format.log` |
 | mypy | 严格检查 `src/drawbridge` | `mypy.log` |
@@ -30,6 +31,13 @@ uv sync --frozen --extra dev
 Git 仓库；其镜像地址为不可用的 `example.invalid`。状态、日志、发布物、模板和数据均
 指向临时目录。运行不会拉取镜像、构建镜像、启动容器或更改现有部署。临时输入结束时
 清理，报告和日志保留在本地证据目录。
+
+隔离 self-check 使用兼容的 `--role all`，只证明 simulation 所需的阻断项。服务器上应分别
+使用 `--role gateway` 和 `--role runner`，避免要求 Gateway 访问 Runner 专属 BuildKit socket。
+即使输出中能找到 `docker` 和
+Docker Compose，也不表示当前用户能连接 Docker daemon、目标镜像已经存在或真实 Compose
+可以启动；它也不检查登记仓库的属主和读写权限。BuildKit 模式下的 self-check 只确认
+`buildctl` 和登记的 Unix socket 存在，不证明 daemon 确实以 rootless 模式运行。
 
 ## 聚焦验证
 
@@ -48,11 +56,12 @@ SQLite 或 Gateway 生命周期相关改动至少应覆盖：并发入队的幂�
 
 ## 真实服务器验收
 
-本地报告不能证明 Gateway 的网络监听、客户端直连、systemd 用户权限、rootless
-BuildKit、Docker image load、Compose 更新、设备访问或业务健康状况。相关变更需阅读
-[OPERATIONS.md](../../docs/OPERATIONS.md)，在目标服务器以管理员批准的配置执行自检，
-再对获准项目运行实际的 register → plan → apply → status，并检查构建日志、release
-制品、容器状态和业务请求。
+本地报告不能证明 Gateway 的网络监听、客户端直连、systemd 用户权限、Git 仓库访问、
+Docker daemon 权限、目标镜像可用性、rootless BuildKit、Docker image load、Compose
+更新、设备访问或业务健康状况。相关变更需阅读 [OPERATIONS.md](../../docs/OPERATIONS.md)，
+在目标服务器分别以 Gateway 和 Runner 用户执行对应的只读权限检查和自检，再对获准项目
+运行实际的 register → plan → apply → status，并检查构建日志、release 制品、容器状态和
+业务请求。
 
 任务 02 已在 t4 对 ContractLens 做过一次额外验收：计划冻结提交后推进分支并临时破坏
 工作区 Compose，Runner 仍从冻结 SHA 发布；该项目按可信配置复用已有镜像，发布命令使用
