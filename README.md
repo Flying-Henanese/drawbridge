@@ -236,6 +236,92 @@ auth:
 初次在预克隆仓库上验证可将 `source_mode` 设为 `local`；默认的 `fetch` 还要求
 Runner 能在 systemd 的 `ProtectHome=true` 限制下访问所需 Git 凭据。
 
+### 已审核的 Compose 使用现有镜像启动（不构建）
+
+此前被默认 Compose 策略拒绝的特权字段、宿主能力或动态插值，可以由管理员审核后按
+Compose 文件摘要批准。此设置会信任该文件的完整内容，应先检查文件中的所有服务、挂载、
+端口、权限、环境变量和它引用的配置文件；SHA-256 只覆盖 Compose 文件本身。
+
+1. 确认 Compose 中每个服务都有 `image:`。若服务同时有 `build:` 和 `image:`，启用
+   `prefer_prebuilt_images` 后仍可运行；只有 `build:`、没有 `image:` 的服务会被拒绝。
+   将所有 `image:` 对应的镜像提前放入 **Runner 所使用的 Docker Engine**，引用名称或摘要
+   必须完全匹配；运行时不会拉取缺失镜像。
+2. 管理员检查将要发布的 Git 版本中的 Compose 文件，并计算其原始文件字节摘要：
+
+   ```sh
+   sha256sum /srv/projects/my-app/compose.yaml
+   ```
+
+   将输出的 64 位小写 SHA-256 分别填入 Gateway 和 Runner 的管理员配置，并保持两份配置一致。
+   下例只展示需要增加或修改的字段；保留配置中已有的其他 app、Git 和环境设置：
+
+   ```yaml
+   allow_simulation: false
+   build_profiles:
+     default:
+       mode: prebuilt
+
+   runtime_profiles:
+     approved-compose:
+       approved_compose_digests:
+         - <64位小写SHA-256>
+       prefer_prebuilt_images: true
+
+   apps:
+     my-app:
+       environments:
+         staging:
+           deployment_mode: docker
+           runtime_profile: approved-compose
+   ```
+
+   `runtime_profile` 是管理员绑定到应用环境的信任策略；MCP 注册参数中的 `profile` 则选择
+   `build_profiles`，通常仍传 `default`。文件任一字节发生变化都要重新审核并更新摘要；摘要
+   不匹配时会直接拒绝，不会退回到 BuildKit。`include` 和 `extends` 始终不支持。
+   摘要批准只放宽 Compose 内容校验，不会把服务器 shell 环境传给 Compose：Runner 使用固定的
+   空 `--env-file`，所以不要依赖源目录 `.env` 或 systemd 环境来替换 Compose 中的 `${VAR}`；
+   需要的值应在审核过的发布文件中明确提供。服务级 `env_file` 用于容器环境变量时，文件也必须
+   随 Git 快照提供。
+3. 分别以 Gateway、Runner 服务用户运行 `self-check`，确认 Docker 权限和镜像可用，再重启
+   两个服务使配置生效。注册操作示例（项目目录须是 `allowed_project_roots` 下的规范绝对路径，
+   不能通过符号链接访问）：
+
+   ```text
+   ops_catalog()
+   ops_app_register(
+     app="my-app",
+     environment="staging",
+     project_dir="/srv/projects/my-app",
+     compose_file="compose.yaml",
+     profile="default",
+     idempotency_key="register-my-app-20260922"
+   )
+   ```
+
+   如果应用已经登记，在管理员配置中添加或更换 `runtime_profile` 后，再调用一次
+   `ops_app_register` 以刷新绑定。
+4. 创建计划并核对目标提交和服务集合，再排队执行。计划默认 15 分钟后过期：
+
+   ```text
+   ops_release_plan(
+     app="my-app",
+     environment="staging",
+     git_ref="refs/heads/main",
+     source_mode="fetch"
+   )
+   ops_release_apply(plan_id="<返回的plan_id>", idempotency_key="deploy-my-app-20260922")
+   ops_release_status(job_id="<返回的job_id>")  # 轮询到 succeeded 或 failed
+   ```
+
+   对服务器已有但尚未 fetch 的提交，可将 `source_mode` 设为 `local`。`apply` 返回成功只表示
+   job 已排队；完成后检查 `ops_release_status` 的健康结果和 `built_images`（应为空），再按需
+   查看 `ops_status`、`ops_logs` 和 `ops_http_request`。实际启动命令固定为
+   `docker compose up --no-build --pull never`，不会构建或拉取镜像。
+
+批准用的 SHA 是 Compose 文件原始字节摘要；计划响应中的 `compose_digest` 是规范化计划指纹，
+两者不是同一个值。t4 上已用 ContractLens 验证这一流程，结果见
+[docs/VERIFICATION_RECORD.md 的 01C 真实发布记录](docs/VERIFICATION_RECORD.md#20-01c-可信-compose-与预建镜像发布验证2026-09-22)。
+
 若连接返回 `401`，检查 token；`403` 检查客户端 CIDR、Host 和 Origin；`421` 检查
 MCP transport 的 Host 校验及端口转发；job 长时间停在 `queued` 时检查 Runner 的
 systemd 状态和日志。
