@@ -97,6 +97,9 @@ Docker 发现和日志读取也在 Gateway 中调用 Docker。Runner 负责队�
 - 构建仅接受与管理员 profile 匹配的 `context` 和 `dockerfile`。自定义 frontend、
   build args、secret、SSH 和额外 context 不由 Compose 自行指定。代码要求 BuildKit
   使用本机 Unix socket；只有 Runner 执行镜像导入和 Compose 更新。
+- 计划阶段和 Runner 使用同一套快照准备与指纹计算原语。计划只能从冻结 SHA 和显式
+  revision 生成；旧 schema、服务拓扑变化或任一冻结指纹不一致时必须返回 `STALE_PLAN`，
+  并在 BuildKit、Docker、simulation release 等外部副作用前停止。
 - HTTP 检查有目标 CIDR、端口、方法及响应大小限制；读请求可直接返回，写请求入队。
   诊断输出和日志有边界与脱敏处理。
 - 本地 `config.example.yaml` 开启 simulation；真实 Docker 构建与部署需要独立的服务器
@@ -115,4 +118,9 @@ Docker 发现和日志读取也在 Gateway 中调用 Docker。Runner 负责队�
   工具会失败；需要调整调用架构后再收紧权限，而不是直接授予 Gateway 广泛 Docker 权限。
 - `self-check` 检查 BuildKit 工具和 socket 是否存在，不验证 daemon 确实以 rootless
   模式运行；该属性需要在服务器上单独确认。
-- 本地 harness 和历史 t4 simulation 证据不证明真实 BuildKit、Docker 或业务容器已通过验收。
+- SQLite 的关键状态转换仍需更完整的显式事务边界；Gateway 初始化仍会执行 schema 初始化。
+  这是[优化改造计划](../../docs/OPTIMIZATION_PLAN.md)中下一项任务 03 的范围。
+- Runner 中断后的租约恢复、Docker 失败后的自动回滚以及 HTTP 验证的 DNS 重绑定防护仍待
+  后续任务完善。
+- t4 已验证 ContractLens 使用现有镜像的 Docker 发布和业务健康检查，但没有执行 BuildKit
+  构建，也不证明上述回滚、中断恢复、权限隔离或其他业务项目已经通过验收。

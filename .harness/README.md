@@ -2,8 +2,8 @@
 
 Drawbridge 是运行在目标 Linux 服务器上的部署与运行观测 MCP 服务。Gateway 提供
 `/mcp`，Runner 消费共享 SQLite 队列中的变更任务。它只操作已登记的 Git/Compose 项目，
-当前实现只支持 `staging` 环境。构建使用单独的 rootless BuildKit；本地示例配置使用
-simulation，不启动业务容器。
+当前实现只支持 `staging` 环境。需要构建时使用单独的 rootless BuildKit；可信项目也可按
+管理员配置复用现有镜像并跳过构建。本地示例配置使用 simulation，不启动业务容器。
 
 项目要解决的是编程智能体修改代码后，如何在远端服务器按固定步骤构建、部署并收集验证
 证据。MCP 客户端提交应用、Git ref 和计划 ID；服务端校验输入、冻结源码版本、排队执行，
@@ -31,6 +31,14 @@ simulation，不启动业务容器。
    和 [运维步骤](../docs/OPERATIONS.md)。长篇设计包含目标状态；实际行为以当前源码和测试为准。
 
 根目录 [AGENTS.md](../AGENTS.md) 是简短入口，完整项目上下文放在本目录。
+
+## 当前改造进度
+
+- [优化改造计划](../docs/OPTIMIZATION_PLAN.md)中的任务 01A、01B、01C 和 02 已完成。
+- 当前第一个未完成任务是任务 03：收紧 SQLite 事务边界，并保证 Gateway 初始化不会执行
+  写迁移。开始下一阶段时先核对该任务及其依赖，不重复实现已完成任务。
+- 任务 02 已在 t4 上完成 harness 和 ContractLens 现有镜像发布验证；这是带日期的历史证据。
+  BuildKit 构建、失败回滚、Runner 中断恢复和严格进程权限仍需各自验收，因此任务 11 尚未完成。
 
 ## 常用入口
 

@@ -34,10 +34,21 @@
 Runner 从共享 SQLite 队列认领部署 job，从计划中的 SHA 创建发布快照，并重新校验
 Compose。随后逐项比较服务集合、Compose、build 声明、workspace revision、binding 配置和
 完整 build profile 摘要。旧格式计划或任一指纹不一致时返回可重试的 `STALE_PLAN`，且不会
-调用 BuildKit、Docker 或写入成功 release。simulation 模式只写发布记录。Docker 模式对登记的 `build:` 服务依次调用
-BuildKit、导出 archive、`docker image load`、查验 image ID，然后以引用 image ID 的
-运行时 Compose 执行 `docker compose up --no-build --pull never --wait`。已有 `image:`
-服务不经 BuildKit。最后保存 release 和健康检查结果。构建流程没有单独的 MCP 工具。
+调用 BuildKit、Docker 或写入成功 release。simulation 模式只写发布记录。Docker 模式对
+登记的 `build:` 服务依次调用 BuildKit、导出 archive、`docker image load`、查验 image ID，
+然后以引用 image ID 的运行时 Compose 执行
+`docker compose up --no-build --pull never --wait`。已有 `image:` 服务不经 BuildKit。
+最后保存 release 和健康检查结果。构建流程没有单独的 MCP 工具。
+
+## 计划不变量
+
+- `commit_sha` 在计划创建后不再跟随分支或标签移动；Runner 只能导出计划保存的 SHA。
+- workspace revision 必须显式保存和重放；没有 revision 时也必须明确使用原始快照，不能用
+  当前工作区内容或隐式的 `current_revision`。
+- 服务集合在注册、计划和执行之间保持一致。Compose 新增、删除或改名服务都要求重新注册
+  或重新创建计划，不能让 Runner 临时扩展发布范围。
+- 计划中的 Compose、build 声明、revision、binding 配置、完整 build profile 和基线摘要
+  必须全部匹配。旧 schema 或任一字段不匹配均以 `STALE_PLAN` 失败；调用者应重新计划。
 
 ## 失败与后续操作
 
@@ -51,6 +62,6 @@ BuildKit、导出 archive、`docker image load`、查验 image ID，然后以引
 - 当前 Docker 发布失败不会自动回滚，Docker release 的显式回滚也未实现；
   `ops_release_rollback` 当前仅能处理 simulation release。不要把失败 job 当成恢复完成。
 
-本地 simulation 只能验证请求、队列和记录路径。真实构建、镜像源连通性、Docker
-权限、端口与健康检查需要在服务器上单独验收，范围见
-[验证说明](../validation/README.md)。
+本地 simulation 只能验证请求、队列和记录路径。t4 上的 ContractLens 已验证“使用现有
+镜像、禁止构建”的 Docker 发布与业务健康检查；该历史结果不覆盖 BuildKit 构建、其他项目、
+权限变化或失败恢复。完整范围见[验证说明](../validation/README.md)。
