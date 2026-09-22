@@ -399,3 +399,27 @@ Drawbridge 修改保留在 `stash@{0}`，原有 `.pre-*` 文件未删除。
 旧计划、服务拓扑在计划阶段拒绝、workspace revision 在解析前应用、旧 plan schema 拒绝、
 各快照指纹篡改、无 build 服务时 profile 变化、binding 配置变化，以及注释、空白和 mapping
 键顺序不影响 Compose 摘要。本地结果没有覆盖真实 Docker/BuildKit；t4 验证另行记录。
+
+## 22. 任务 02 的 t4 冻结 SHA 与 ContractLens 发布验证（2026-09-22）
+
+将 Drawbridge commit `a47734a` 部署到 t4 的
+`/home/mineru_dev/github_repo/drawbridge`，远端完整 harness 报告为
+`/home/mineru_dev/github_repo/drawbridge/var/verification/20260922T052846Z/report.json`，
+`result: passed`；Python 3.12.12 下 Ruff、格式、mypy、编译、67 个 pytest、隔离 self-check
+和 simulation 全部通过。随后重启 Gateway 与 Runner，两个 systemd user service 均为 active。
+
+通过实际 MCP Gateway 为 `contractlens-trusted` 创建计划
+`79a95de3-b3d8-4bc5-ab2a-dd56cf7a3297`，计划冻结 ContractLens SHA
+`e62f54c4be797821947cd1fc6e02c0450a56a6a0`。创建计划后，在同一分支生成空提交
+`b82488da940db3eec58f3c08c14f12312d68ef08`，并在 apply 和 Runner 执行期间将工作区
+`compose.yaml` 临时替换为无效内容。job
+`f5fb1d65-9310-4b7c-a85e-f583d18d81af` 最终 `succeeded`，release
+`bad03865-5f7c-4bb8-883d-ea5496e24ee1` 的 `source_sha` 仍为计划冻结的 `e62f54c...`，证明
+Runner 没有重新解析已前进的分支，也没有读取未提交工作区。
+
+本次继续使用可信 Compose 的预建镜像路径；job 结果中的 `built_images` 为 `{}`，没有执行
+BuildKit、镜像导入或镜像拉取。三个 Compose 容器均为 `healthy`，MCP `ops_status` 指向上述
+release，`ops_logs` 返回 API 日志，`ops_http_request` 对 OpenAPI 地址返回 200。测试结束后
+`compose.yaml` 已恢复，SHA-256 仍为
+`33df309daa107f3f3378e8b67f0936a8aca00dbb25184d106be0e3d9b96c51bc`。用于推进分支的空提交只
+保留在 t4 的 ContractLens 工作树，没有推送远端；原有未跟踪备份文件未删除。
