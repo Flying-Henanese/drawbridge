@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -599,6 +600,112 @@ async def test_release_with_prebuilt_image_skips_buildkit(tmp_path: Path, monkey
         current = await database.get_current_release("demo", "staging")
         assert current is not None
         assert current["image_services"] == {"app": "alpine:3.20"}
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_trusted_compose_prefers_existing_image_over_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    (project / "compose.yaml").write_text(
+        "services:\n"
+        "  app:\n"
+        "    image: ${APP_IMAGE:-alpine:3.20}\n"
+        "    build:\n"
+        "      context: .\n"
+        "      args: {APP_MODE: production}\n"
+        "    network_mode: host\n"
+        "    cap_add: [SYS_ADMIN]\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "compose.yaml"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "trusted compose"], cwd=project, check=True, capture_output=True)
+    approved_digest = hashlib.sha256((project / "compose.yaml").read_bytes()).hexdigest()
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        concurrency={"min_deploy_interval_seconds": 0},
+        runtime_profiles={
+            "trusted": {
+                "approved_compose_digests": [approved_digest],
+                "prefer_prebuilt_images": True,
+            }
+        },
+        apps={
+            "demo": {
+                "git": {
+                    "repo_path": str(project),
+                    "origin": "https://example.invalid/drawbridge.git",
+                },
+                "environments": {
+                    "staging": {
+                        "project_name": "demo",
+                        "runtime_profile": "trusted",
+                    }
+                },
+            }
+        },
+        build_profiles={"default": {"mode": "prebuilt"}},
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    try:
+        service = DrawbridgeService(settings, database, base_dir=tmp_path)
+        seen: list[str] = []
+
+        async def execute(spec: ExecutionSpec) -> ExecutionResult:
+            seen.append(spec.label)
+            return ExecutionResult(0, TerminationReason.EXITED, 1, "", "", 0, 0, 0, False)
+
+        monkeypatch.setattr("drawbridge.service.shutil.which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(service.executor, "execute", execute)
+        registered = await service.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="compose.yaml",
+            idempotency_key="register-trusted-001",
+        )
+        assert registered["status"] == "ok"
+        planned = await service.release_plan(
+            app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+        )
+        applied = await service.release_apply(plan_id=planned["data"]["plan_id"], idempotency_key="apply-trusted-001")
+        await service.run_one_job()
+        status = await service.release_status(applied["data"]["job_id"])
+
+        assert status["data"]["status"] == "succeeded"
+        assert seen == ["compose-deploy"]
+        current = await database.get_current_release("demo", "staging")
+        assert current is not None
+        assert current["built_images"] == {}
+        runtime_compose = yaml.safe_load(Path(current["compose_file"]).read_text(encoding="utf-8"))
+        assert runtime_compose["services"]["app"]["build"]["args"] == {"APP_MODE": "production"}
+
+        (project / "compose.yaml").write_text(
+            "services:\n  app:\n    image: alpine:3.20\n    build: .\n    command: [sleep, '60']\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "compose.yaml"], cwd=project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "change trusted compose"], cwd=project, check=True, capture_output=True)
+        seen.clear()
+        changed_plan = await service.release_plan(
+            app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+        )
+        changed_apply = await service.release_apply(
+            plan_id=changed_plan["data"]["plan_id"], idempotency_key="apply-trusted-changed-001"
+        )
+        await service.run_one_job()
+        changed_status = await service.release_status(changed_apply["data"]["job_id"])
+
+        assert changed_status["data"]["status"] == "failed"
+        assert changed_status["data"]["error_code"] == "INVALID_PARAMETER"
+        assert "digest is not approved" in changed_status["data"]["message"]
+        assert seen == []
     finally:
         await database.close()
 

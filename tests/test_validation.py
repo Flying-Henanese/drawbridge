@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -299,6 +300,106 @@ def test_compose_rejects_unsupported_top_level_resources(
         parse_compose(compose, project)
 
 
+def test_trusted_compose_allows_admin_approved_capabilities_and_prebuilt_images(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    compose = project / "compose.yaml"
+    compose.write_text(
+        "services:\n"
+        "  app:\n"
+        "    image: ${APP_IMAGE:-alpine:3.20}\n"
+        "    build:\n"
+        "      context: .\n"
+        "      args: {APP_MODE: production}\n"
+        "    network_mode: host\n"
+        "    ipc: host\n"
+        "    cap_add: [SYS_ADMIN]\n"
+        "    devices: [/dev/example:/dev/example]\n"
+        "    security_opt: [seccomp:unconfined]\n"
+        "volumes:\n"
+        "  shared: {external: true}\n"
+        "networks:\n"
+        "  existing: {external: true}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ComposeError, match="unsupported key"):
+        parse_compose(compose, project)
+
+    approved_digest = hashlib.sha256(compose.read_bytes()).hexdigest()
+    spec = parse_compose(
+        compose,
+        project,
+        runtime_profile={"approved_compose_digests": [approved_digest], "prefer_prebuilt_images": True},
+    )
+
+    assert spec.services == ("app",)
+    assert spec.build_services == ()
+    assert spec.image_services == {"app": "${APP_IMAGE:-alpine:3.20}"}
+    assert spec.raw["services"]["app"]["network_mode"] == "host"
+    assert spec.raw["services"]["app"]["build"]["args"] == {"APP_MODE": "production"}
+
+
+def test_trusted_compose_does_not_allow_include_or_build_only_prebuilt_services(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    compose = project / "compose.yaml"
+    compose.write_text(
+        "include: [other.yaml]\nservices:\n  app:\n    image: alpine:3.20\n",
+        encoding="utf-8",
+    )
+    approved_digest = hashlib.sha256(compose.read_bytes()).hexdigest()
+    profile = {"approved_compose_digests": [approved_digest], "prefer_prebuilt_images": True}
+
+    with pytest.raises(ComposeError, match="include/extends"):
+        parse_compose(compose, project, runtime_profile=profile)
+
+    for key in ("include", "extends"):
+        compose.write_text(
+            f"services:\n  app:\n    image: alpine:3.20\n    {key}:\n      file: other.yaml\n      service: base\n",
+            encoding="utf-8",
+        )
+        profile["approved_compose_digests"] = [hashlib.sha256(compose.read_bytes()).hexdigest()]
+        with pytest.raises(ComposeError, match="include/extends"):
+            parse_compose(compose, project, runtime_profile=profile)
+
+    compose.write_text("services:\n  app:\n    build: .\n", encoding="utf-8")
+    profile["approved_compose_digests"] = [hashlib.sha256(compose.read_bytes()).hexdigest()]
+    with pytest.raises(ComposeError, match="prebuilt image"):
+        parse_compose(compose, project, runtime_profile=profile)
+
+
+def test_trusted_compose_requires_an_exact_approved_digest(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    compose = project / "compose.yaml"
+    compose.write_text(
+        "services:\n  app:\n    image: alpine:3.20\n    network_mode: host\n",
+        encoding="utf-8",
+    )
+    original_digest = hashlib.sha256(compose.read_bytes()).hexdigest()
+    profile = {"approved_compose_digests": [original_digest]}
+
+    assert parse_compose(compose, project, runtime_profile=profile).services == ("app",)
+
+    compose.write_text(
+        "services:\n  app:\n    image: alpine:3.20\n    network_mode: host\n    cap_add: [SYS_ADMIN]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ComposeError, match="unsupported key"):
+        parse_compose(compose, project, runtime_profile=profile)
+
+    with pytest.raises(ComposeError, match="digest is not approved"):
+        parse_compose(
+            compose,
+            project,
+            runtime_profile={
+                "approved_compose_digests": [original_digest],
+                "prefer_prebuilt_images": True,
+            },
+        )
+
+
 def test_compose_allows_only_exact_ascend_runtime_profile(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -417,6 +518,19 @@ def test_runtime_profile_configuration_is_strict_and_must_exist() -> None:
         },
     )
     assert settings.apps["demo"].environments["staging"].runtime_profile == "ascend"
+
+    trusted = Settings(
+        auth={"mode": "token", "token": "local-test-token"},
+        runtime_profiles={"legacy": {"approved_compose_digests": ["a" * 64], "prefer_prebuilt_images": True}},
+    )
+    assert trusted.runtime_profiles["legacy"].approved_compose_digests == ["a" * 64]
+    assert trusted.runtime_profiles["legacy"].prefer_prebuilt_images is True
+
+    with pytest.raises(ValidationError, match="prefer_prebuilt_images"):
+        Settings(
+            auth={"mode": "token", "token": "local-test-token"},
+            runtime_profiles={"invalid": {"prefer_prebuilt_images": True}},
+        )
 
     with pytest.raises(ValidationError, match="runtime_profile"):
         Settings(

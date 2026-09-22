@@ -12,7 +12,6 @@ from .config import BuildProfile, BuildTarget
 from .errors import DrawbridgeError
 from .process import ExecutionResult, ExecutionSpec, SafeExecutor, TerminationReason
 
-
 _SAFE_DOCKERFILE_FRONTEND = re.compile(r"docker/dockerfile:1(?:\.[0-9]+)?(?:@sha256:[0-9a-f]{64})?")
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -62,6 +63,8 @@ class _RuntimePolicy:
     host_mounts: tuple[_AllowedHostMount, ...]
     ports: dict[str, frozenset[_PublishedPort]]
     device_reservations: dict[str, tuple[_DeviceReservation, ...]]
+    trusted_compose: bool
+    prefer_prebuilt_images: bool
 
 
 _ALLOWED_SERVICE_KEYS = {
@@ -111,7 +114,8 @@ def parse_compose(
     if path.stat().st_size > 256 * 1024:
         raise ComposeError("compose_file is too large")
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        compose_bytes = path.read_bytes()
+        raw = yaml.safe_load(compose_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ComposeError(f"invalid compose YAML: {exc}") from exc
     if not isinstance(raw, dict) or not isinstance(raw.get("services"), dict) or not raw["services"]:
@@ -119,13 +123,15 @@ def parse_compose(
     if any(key in raw for key in ("include", "extends")):
         raise ComposeError("compose include/extends is not supported")
 
-    allowed_root = {"version", "name", "services", "networks", "volumes", "configs", "secrets"}
-    unknown_root = set(raw) - allowed_root
-    if unknown_root:
-        raise ComposeError(f"unsupported compose top-level keys: {sorted(unknown_root)}")
     normalized_data_mounts = _normalize_data_mounts(allowed_data_mounts or ())
-    policy = _normalize_runtime_profile(runtime_profile or {})
-    _validate_top_level_resources(raw)
+    compose_digest = hashlib.sha256(compose_bytes).hexdigest()
+    policy = _normalize_runtime_profile(runtime_profile or {}, compose_digest=compose_digest)
+    if not policy.trusted_compose:
+        allowed_root = {"version", "name", "services", "networks", "volumes", "configs", "secrets"}
+        unknown_root = set(raw) - allowed_root
+        if unknown_root:
+            raise ComposeError(f"unsupported compose top-level keys: {sorted(unknown_root)}")
+        _validate_top_level_resources(raw)
 
     services: list[str] = []
     image_services: dict[str, str] = {}
@@ -135,28 +141,31 @@ def parse_compose(
             raise ComposeError(f"invalid service name: {name!r}")
         if not isinstance(service, dict):
             raise ComposeError(f"service {name} must be a mapping")
-        unknown_service_keys = set(service) - _ALLOWED_SERVICE_KEYS
-        if unknown_service_keys:
-            field = sorted(unknown_service_keys)[0]
-            raise ComposeError(f"service {name} uses unsupported key {field}")
-        _validate_service_capabilities(name, service, policy)
-        if "environment" in service and isinstance(service["environment"], dict):
-            for key, value in service["environment"].items():
-                if isinstance(value, str) and "${" in value:
-                    raise ComposeError(f"dynamic interpolation is not allowed: {name}.environment.{key}")
-        for value in _walk_strings(service):
-            if "${" in value:
-                raise ComposeError(f"dynamic interpolation is not allowed in service {name}")
-        if "volumes" in service:
-            _validate_volumes(
-                name,
-                service["volumes"],
-                project_dir,
-                normalized_data_mounts,
-                policy.host_mounts,
-            )
-        if "env_file" in service:
-            _validate_env_files(name, service["env_file"], project_dir)
+        if any(key in service for key in ("include", "extends")):
+            raise ComposeError("compose include/extends is not supported")
+        if not policy.trusted_compose:
+            unknown_service_keys = set(service) - _ALLOWED_SERVICE_KEYS
+            if unknown_service_keys:
+                field = sorted(unknown_service_keys)[0]
+                raise ComposeError(f"service {name} uses unsupported key {field}")
+            _validate_service_capabilities(name, service, policy)
+            if "environment" in service and isinstance(service["environment"], dict):
+                for key, value in service["environment"].items():
+                    if isinstance(value, str) and "${" in value:
+                        raise ComposeError(f"dynamic interpolation is not allowed: {name}.environment.{key}")
+            for value in _walk_strings(service):
+                if "${" in value:
+                    raise ComposeError(f"dynamic interpolation is not allowed in service {name}")
+            if "volumes" in service:
+                _validate_volumes(
+                    name,
+                    service["volumes"],
+                    project_dir,
+                    normalized_data_mounts,
+                    policy.host_mounts,
+                )
+            if "env_file" in service:
+                _validate_env_files(name, service["env_file"], project_dir)
         image = service.get("image")
         build = service.get("build")
         if image is None and build is None:
@@ -164,7 +173,11 @@ def parse_compose(
         if image is not None and not isinstance(image, str):
             raise ComposeError(f"service {name}.image must be a string")
         if build is not None:
-            build_services.append(name)
+            if policy.prefer_prebuilt_images:
+                if image is None:
+                    raise ComposeError(f"service {name} requires a prebuilt image when builds are disabled")
+            else:
+                build_services.append(name)
         if image is not None:
             image_services[name] = image
         services.append(name)
@@ -249,8 +262,15 @@ def docker_discover(*, max_items: int = 1000) -> list[dict[str, Any]]:
     return candidates
 
 
-def _normalize_runtime_profile(value: Mapping[str, Any]) -> _RuntimePolicy:
-    allowed_keys = {"privileged_services", "host_mounts", "ports", "device_reservations"}
+def _normalize_runtime_profile(value: Mapping[str, Any], *, compose_digest: str) -> _RuntimePolicy:
+    allowed_keys = {
+        "privileged_services",
+        "host_mounts",
+        "ports",
+        "device_reservations",
+        "approved_compose_digests",
+        "prefer_prebuilt_images",
+    }
     unknown = set(value) - allowed_keys
     if unknown:
         raise ComposeError(f"runtime profile contains unsupported keys: {sorted(unknown)}")
@@ -316,11 +336,28 @@ def _normalize_runtime_profile(value: Mapping[str, Any]) -> _RuntimePolicy:
         device_reservations[service] = tuple(
             _normalize_device_reservation(entry, f"runtime profile for {service}") for entry in entries
         )
+    approved_values = value.get("approved_compose_digests", [])
+    prefer_prebuilt_images = value.get("prefer_prebuilt_images", False)
+    if not isinstance(approved_values, list) or not all(isinstance(item, str) for item in approved_values):
+        raise ComposeError("runtime profile approved_compose_digests must be a list of SHA-256 values")
+    if any(
+        len(item) != 64 or any(character not in "0123456789abcdef" for character in item) for item in approved_values
+    ):
+        raise ComposeError("runtime profile approved_compose_digests contains an invalid SHA-256 value")
+    if type(prefer_prebuilt_images) is not bool:
+        raise ComposeError("runtime profile prefer_prebuilt_images must be a boolean")
+    if prefer_prebuilt_images and not approved_values:
+        raise ComposeError("runtime profile prefer_prebuilt_images requires approved_compose_digests")
+    trusted_compose = compose_digest in approved_values
+    if prefer_prebuilt_images and not trusted_compose:
+        raise ComposeError("compose digest is not approved for the prebuilt image policy")
     return _RuntimePolicy(
         privileged_services=privileged_services,
         host_mounts=tuple(host_mounts),
         ports=ports,
         device_reservations=device_reservations,
+        trusted_compose=trusted_compose,
+        prefer_prebuilt_images=prefer_prebuilt_images,
     )
 
 

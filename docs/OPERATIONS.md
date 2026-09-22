@@ -79,6 +79,33 @@ NPU/GPU 应由管理员在配置文件的 `runtime_profiles` 中按服务精确�
 - `ports`：精确匹配发布 IP、宿主端口、容器端口和协议；
 - `device_reservations`：精确匹配 Compose deploy reservation 的 driver、device IDs 和 capabilities。
 
+对管理员已经审核的旧应用，可以在专用 profile 的 `approved_compose_digests` 中登记 Compose
+文件的 SHA-256。只有文件内容摘要精确匹配时，才允许其中原本被严格策略拒绝的服务字段、顶层
+资源、宿主能力和 `${...}` 插值；文件变化后必须由管理员重新审核并更新摘要。Compose 文件仍
+必须位于已登记项目目录内、不是符号链接、大小受限并包含合法服务；顶层
+及服务级 `include`/`extends` 始终不支持。可用 `sha256sum compose.yaml` 计算待批准摘要。
+
+如果可信 Compose 同时保留 `image:` 和开发用的 `build:`，但服务器只应启动现有镜像，可同时
+设置 `prefer_prebuilt_images: true`。Runner 会保留 Compose 内容并使用既有的
+`docker compose up --no-build --pull never` 路径，不调用 BuildKit；只有 `build:`、没有
+`image:` 的服务会在注册阶段被拒绝。该选项要求 profile 至少登记一个批准摘要；摘要不匹配时
+直接拒绝，不回退到构建。未设置该选项的 profile 在摘要不匹配时才恢复默认严格校验：
+
+```yaml
+runtime_profiles:
+  approved-legacy-app:
+    approved_compose_digests:
+      - 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    prefer_prebuilt_images: true
+
+apps:
+  approved-app:
+    # git and environment fields omitted
+    environments:
+      staging:
+        runtime_profile: approved-legacy-app
+```
+
 Ascend profile 应为每个实际 NPU 服务登记 driver、`npu-smi`、DCMI 和模型缓存挂载，并加入：
 
 ```yaml

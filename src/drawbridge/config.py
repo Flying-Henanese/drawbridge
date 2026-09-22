@@ -99,6 +99,24 @@ class RuntimeProfileConfig(ConfigModel):
     host_mounts: list[RuntimeHostMountConfig] = Field(default_factory=list)
     ports: dict[StrictStr, list[StrictStr]] = Field(default_factory=dict)
     device_reservations: dict[StrictStr, list[RuntimeDeviceReservationConfig]] = Field(default_factory=dict)
+    approved_compose_digests: list[StrictStr] = Field(default_factory=list)
+    prefer_prebuilt_images: StrictBool = False
+
+    @field_validator("approved_compose_digests")
+    @classmethod
+    def validate_compose_digests(cls, values: list[str]) -> list[str]:
+        for value in values:
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError("approved_compose_digests must contain lowercase SHA-256 values")
+        if len(set(values)) != len(values):
+            raise ValueError("approved_compose_digests must not contain duplicates")
+        return values
+
+    @model_validator(mode="after")
+    def validate_prebuilt_policy(self) -> RuntimeProfileConfig:
+        if self.prefer_prebuilt_images and not self.approved_compose_digests:
+            raise ValueError("prefer_prebuilt_images requires approved_compose_digests")
+        return self
 
 
 class GitConfig(ConfigModel):

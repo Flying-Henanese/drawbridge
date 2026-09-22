@@ -489,9 +489,14 @@ Compose 的宿主 bind 挂载在注册和发布快照阶段使用同一策略校
 需要 NPU/GPU 等宿主能力时，管理员还可登记 `runtime_profiles`，再由特定环境通过
 `runtime_profile` 引用。profile 按服务精确登记 `privileged_services`、宿主挂载、发布端口
 和 Compose device reservation；绑定会保存 profile 内容，注册与 Git 发布快照使用同一份
-策略复验。`security_opt` 仅支持降低权限的 `no-new-privileges:true`。仓库中的 Compose
-不能自行申请 profile，也不能使用 `volumes_from`、host namespace、`cap_add`、顶层
-`driver_opts`、外部 network/config/secret 或未登记的端口和设备。
+策略复验。`security_opt` 仅支持降低权限的 `no-new-privileges:true`。管理员审核过的旧应用
+可以在专用 profile 的 `approved_compose_digests` 中登记 Compose 文件 SHA-256；只有内容摘要
+精确匹配时才放宽字段和宿主能力限制，文件变化后恢复严格策略。若同时设置
+`prefer_prebuilt_images`，含 `image` 与 `build` 的服务只使用现有镜像，且不会调用 BuildKit。
+此时摘要不匹配会直接拒绝，不能降级到 BuildKit；未设置预建选项时才恢复严格策略。
+该信任扩展仍拒绝顶层或服务级 `include`/`extends` 和缺少 `image` 的免构建服务。仓库中的
+Compose 不能自行申请 profile；未被摘要批准时，也不能使用 `volumes_from`、host namespace、
+`cap_add`、顶层 `driver_opts`、外部 network/config/secret 或未登记的端口和设备。
 
 以下示例展示 Ascend 服务所需的受控宿主挂载；两个 NPU 服务应分别登记同一组挂载，且
 `/etc/ascend_install.info` 必须只读，`/var/log/npu` 保持可写：
