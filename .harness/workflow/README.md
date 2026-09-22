@@ -13,6 +13,8 @@
 3. 按需查[技术设计](../../docs/TECHNICAL_DESIGN.md)、
    [实施规格](../../docs/MVP_IMPLEMENTATION_SPEC.md)或
    [运维步骤](../../docs/OPERATIONS.md)，再以源码和测试确认当前行为。
+4. 若任务来自[优化改造计划](../../docs/OPTIMIZATION_PLAN.md)，从第一个未完成任务继续，
+   核对依赖和验收标准。当前 01A、01B、01C、02 已完成，下一项是任务 03。
 
 ## 2. 修改与局部检查
 
@@ -41,6 +43,7 @@
 | --- | --- |
 | MCP 工具或入口认证 | `gateway.py`、`models.py`、`tests/test_gateway.py` |
 | 注册、计划、部署、回滚 | `service.py`、`storage.py`、`tests/test_service.py`、`tests/test_storage.py` |
+| 冻结 SHA、计划指纹或服务拓扑 | `service.py`、`gitops.py`、`tests/test_service.py` |
 | Git ref 或快照 | `gitops.py`、`tests/test_git.py` |
 | Compose、构建 profile 或镜像 | `compose.py`、`build.py`、`config.py`、`tests/test_validation.py`、`tests/test_service.py` |
 | 出站 HTTP、受控进程 | `httpverify.py`、`process.py` 及对应测试 |

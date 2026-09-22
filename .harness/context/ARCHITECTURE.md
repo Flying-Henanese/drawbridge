@@ -60,14 +60,18 @@ Docker 发现和日志读取也在 Gateway 中调用 Docker。Runner 负责队�
    项目内的 Compose 文件和已登记的构建 profile。服务端拒绝符号链接路径、无效 Git
    origin、不支持的 Compose 特权键和未登记的构建选项。注册成功才会保存应用绑定。
 2. **计划**：`ops_release_plan` 在绑定的仓库中以 `fetch` 或 `local` 模式解析完整 Git ref
-   或允许的 SHA，冻结 commit、服务集合、绑定版本、构建 profile 摘要和当前发布基线。
-   计划有 15 分钟有效期；这里不构建或部署。
+   或允许的 SHA，从该 SHA 的 archive 创建临时快照，应用显式选择的 workspace revision，
+   再校验 Compose、build 声明和固定服务集合。计划冻结规范化 Compose/build/revision 指纹、
+   binding 配置白名单摘要、完整 build profile 摘要和当前发布基线。计划有 15 分钟有效期；
+   临时快照在返回前清理，这里不构建或部署。
 3. **排队**：`ops_release_apply(plan_id, idempotency_key)` 检查计划及基线，将部署任务写入
    SQLite，返回 `job_id`。当前配置将同时运行的变更任务限定为一个。工具结果中的
    `status: ok` 只表示已接受；客户端需轮询
    `ops_release_status(job_id)` 才能知道任务结果。
-4. **执行**：Runner 从队列认领任务，按冻结 SHA 用 `git archive` 创建发布快照，应用
-   可选的已登记 workspace revision，再从快照重新校验 Compose。
+4. **执行**：Runner 从队列认领任务，先复验 plan schema、binding 配置、build profile 和
+   当前基线，再按冻结 SHA 用 `git archive` 创建发布快照并应用显式 revision。Runner 使用
+   与计划阶段相同的原语重新计算全部快照指纹；任一字段不一致都在构建、Compose 或 simulation
+   release 写入前以 `STALE_PLAN` 终止。
 5. **构建与部署**：simulation 只写发布证据。Docker 模式对 `build:` 服务调用固定的
    BuildKit profile，导出 Docker archive，导入 Docker Engine，查验镜像 ID，生成引用
    镜像 ID 的运行时 Compose，然后执行带 `--detach`、`--no-build`、`--pull never` 和
@@ -93,6 +97,9 @@ Docker 发现和日志读取也在 Gateway 中调用 Docker。Runner 负责队�
 - 构建仅接受与管理员 profile 匹配的 `context` 和 `dockerfile`。自定义 frontend、
   build args、secret、SSH 和额外 context 不由 Compose 自行指定。代码要求 BuildKit
   使用本机 Unix socket；只有 Runner 执行镜像导入和 Compose 更新。
+- 计划阶段和 Runner 使用同一套快照准备与指纹计算原语。计划只能从冻结 SHA 和显式
+  revision 生成；旧 schema、服务拓扑变化或任一冻结指纹不一致时必须返回 `STALE_PLAN`，
+  并在 BuildKit、Docker、simulation release 等外部副作用前停止。
 - HTTP 检查有目标 CIDR、端口、方法及响应大小限制；读请求可直接返回，写请求入队。
   诊断输出和日志有边界与脱敏处理。
 - 本地 `config.example.yaml` 开启 simulation；真实 Docker 构建与部署需要独立的服务器
@@ -111,4 +118,9 @@ Docker 发现和日志读取也在 Gateway 中调用 Docker。Runner 负责队�
   工具会失败；需要调整调用架构后再收紧权限，而不是直接授予 Gateway 广泛 Docker 权限。
 - `self-check` 检查 BuildKit 工具和 socket 是否存在，不验证 daemon 确实以 rootless
   模式运行；该属性需要在服务器上单独确认。
-- 本地 harness 和历史 t4 simulation 证据不证明真实 BuildKit、Docker 或业务容器已通过验收。
+- SQLite 的关键状态转换仍需更完整的显式事务边界；Gateway 初始化仍会执行 schema 初始化。
+  这是[优化改造计划](../../docs/OPTIMIZATION_PLAN.md)中下一项任务 03 的范围。
+- Runner 中断后的租约恢复、Docker 失败后的自动回滚以及 HTTP 验证的 DNS 重绑定防护仍待
+  后续任务完善。
+- t4 已验证 ContractLens 使用现有镜像的 Docker 发布和业务健康检查，但没有执行 BuildKit
+  构建，也不证明上述回滚、中断恢复、权限隔离或其他业务项目已经通过验收。

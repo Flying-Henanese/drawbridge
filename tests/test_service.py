@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -49,6 +51,37 @@ def make_project(root: Path) -> tuple[Path, str]:
     return project, sha
 
 
+def mutate_plan(database: Database, plan_id: str, field: str, value: object) -> None:
+    with sqlite3.connect(database.path) as connection:
+        row = connection.execute("SELECT payload FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()
+        assert row is not None
+        payload = json.loads(row[0])
+        payload[field] = value
+        connection.execute(
+            "UPDATE plans SET payload = ? WHERE plan_id = ?",
+            (json.dumps(payload, sort_keys=True), plan_id),
+        )
+
+
+def mutate_job(database: Database, job_id: str, field: str, value: object) -> None:
+    with sqlite3.connect(database.path) as connection:
+        row = connection.execute("SELECT payload FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        assert row is not None
+        payload = json.loads(row[0])
+        payload[field] = value
+        connection.execute(
+            "UPDATE jobs SET payload = ? WHERE job_id = ?",
+            (json.dumps(payload, sort_keys=True), job_id),
+        )
+
+
+def plan_count(database: Database) -> int:
+    with sqlite3.connect(database.path) as connection:
+        row = connection.execute("SELECT COUNT(*) FROM plans").fetchone()
+        assert row is not None
+        return int(row[0])
+
+
 @pytest.mark.asyncio
 async def test_register_plan_apply_simulation_is_idempotent(tmp_path: Path) -> None:
     project, sha = make_project(tmp_path / "projects")
@@ -80,6 +113,9 @@ async def test_register_plan_apply_simulation_is_idempotent(tmp_path: Path) -> N
     )
     assert planned["status"] == "ok"
     assert planned["data"]["commit_sha"] == sha
+    (project / "README.md").write_text("branch advanced\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "advance branch"], cwd=project, check=True, capture_output=True)
     (project / "compose.yaml").write_text("not valid compose\n", encoding="utf-8")
 
     applied = await service.release_apply(plan_id=planned["data"]["plan_id"], idempotency_key="deploy-001")
@@ -98,6 +134,410 @@ async def test_register_plan_apply_simulation_is_idempotent(tmp_path: Path) -> N
     assert current is not None
     assert current["source_sha"] == sha
     assert "services:" in Path(current["compose_file"]).read_text(encoding="utf-8")
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_release_plan_rejects_service_topology_change_before_saving_plan(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        allow_simulation=True,
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+    registered = await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-topology-001",
+    )
+    assert registered["status"] == "ok"
+    (project / "compose.yaml").write_text(
+        "services:\n  app:\n    image: alpine:3.20\n  extra:\n    image: alpine:3.20\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "compose.yaml"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "add service"], cwd=project, check=True, capture_output=True)
+
+    planned = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+
+    assert planned["status"] == "error"
+    assert planned["error"]["code"] == "UNSUPPORTED_SERVICE_CHANGE"
+    assert plan_count(database) == 0
+    assert not any((tmp_path / "state" / "plan-snapshots").iterdir())
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_release_apply_rejects_old_plan_schema_without_queueing(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        allow_simulation=True,
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+    await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-old-plan-001",
+    )
+    planned = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+    plan_id = planned["data"]["plan_id"]
+    mutate_plan(database, plan_id, "plan_schema_version", 0)
+
+    applied = await service.release_apply(plan_id=plan_id, idempotency_key="apply-old-plan-001")
+
+    assert applied["status"] == "error"
+    assert applied["error"]["code"] == "STALE_PLAN"
+    assert applied["error"]["retryable"] is True
+    assert await database.get_job_by_plan(plan_id) is None
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_rechecks_plan_schema_before_creating_snapshot(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        allow_simulation=True,
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+    await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-runner-schema-001",
+    )
+    planned = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+    applied = await service.release_apply(
+        plan_id=planned["data"]["plan_id"],
+        idempotency_key="apply-runner-schema-001",
+    )
+    mutate_job(database, applied["data"]["job_id"], "plan_schema_version", 0)
+
+    await service.run_one_job()
+    status = await service.release_status(applied["data"]["job_id"])
+
+    assert status["data"]["status"] == "failed"
+    assert status["data"]["error_code"] == "STALE_PLAN"
+    assert await database.get_current_release("demo", "staging") is None
+    assert not (tmp_path / "releases" / "demo" / "staging").exists()
+    await database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("service_set", ["other"]),
+        ("compose_digest", "0" * 64),
+        ("build_declaration_digest", "1" * 64),
+    ],
+)
+async def test_runner_rejects_tampered_snapshot_fingerprint_before_side_effects(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        allow_simulation=True,
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+    await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key=f"register-fingerprint-{field}",
+    )
+    planned = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+    plan_id = planned["data"]["plan_id"]
+    mutate_plan(database, plan_id, field, value)
+    applied = await service.release_apply(plan_id=plan_id, idempotency_key=f"apply-fingerprint-{field}")
+    assert applied["status"] == "ok"
+
+    await service.run_one_job()
+    status = await service.release_status(applied["data"]["job_id"])
+
+    assert status["data"]["status"] == "failed"
+    assert status["data"]["error_code"] == "STALE_PLAN"
+    assert field in status["data"]["message"]
+    assert await database.get_current_release("demo", "staging") is None
+    release_root = tmp_path / "releases" / "demo" / "staging"
+    assert not release_root.exists() or not list(release_root.iterdir())
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_release_apply_compares_configuration_and_build_profile_without_build_services(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        allow_simulation=True,
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+    await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-config-digest-001",
+    )
+    configuration_plan = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+    binding = await database.get_binding("demo", "staging")
+    assert binding is not None
+    with sqlite3.connect(database.path) as connection:
+        binding["project_name"] = "changed-without-version"
+        connection.execute(
+            "UPDATE app_bindings SET payload = ? WHERE app = 'demo' AND environment = 'staging'",
+            (json.dumps(binding, sort_keys=True),),
+        )
+    configuration_apply = await service.release_apply(
+        plan_id=configuration_plan["data"]["plan_id"],
+        idempotency_key="apply-config-digest-001",
+    )
+    assert configuration_apply["status"] == "error"
+    assert configuration_apply["error"]["code"] == "STALE_PLAN"
+    assert "configuration_digest" in configuration_apply["error"]["message"]
+
+    binding["project_name"] = "drawbridge-demo-staging"
+    await database.save_binding("demo", "staging", binding, status="deployable")
+    profile_plan = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+    profile_apply = await service.release_apply(
+        plan_id=profile_plan["data"]["plan_id"],
+        idempotency_key="apply-profile-digest-001",
+    )
+    assert profile_apply["status"] == "ok"
+    settings.build_profiles["default"].platform = "linux/arm64"
+    await service.run_one_job()
+    profile_status = await service.release_status(profile_apply["data"]["job_id"])
+    assert profile_status["data"]["status"] == "failed"
+    assert profile_status["data"]["error_code"] == "STALE_PLAN"
+    assert "build_profile_digest" in profile_status["data"]["message"]
+    assert await database.get_current_release("demo", "staging") is None
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_compose_digest_uses_normalized_structure(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        allow_simulation=True,
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+    await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-normalized-digest-001",
+    )
+    first = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+    (project / "compose.yaml").write_text(
+        "# keys intentionally reordered\nservices:\n  app:\n    command: [sleep, '30']\n    image: alpine:3.20\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "compose.yaml"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "format compose"], cwd=project, check=True, capture_output=True)
+    reordered = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+    assert reordered["data"]["compose_digest"] == first["data"]["compose_digest"]
+
+    (project / "compose.yaml").write_text(
+        "services:\n  app:\n    command: [sleep, '31']\n    image: alpine:3.20\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "compose.yaml"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "change compose"], cwd=project, check=True, capture_output=True)
+    changed = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+    assert changed["data"]["compose_digest"] != first["data"]["compose_digest"]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_release_plan_validates_new_build_declaration_before_saving(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        allow_simulation=True,
+        build_profiles={"default": {"mode": "prebuilt"}},
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+    await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-build-plan-001",
+    )
+    (project / "compose.yaml").write_text(
+        "services:\n  app:\n    build: .\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "compose.yaml"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "add build"], cwd=project, check=True, capture_output=True)
+
+    planned = await service.release_plan(
+        app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+    )
+
+    assert planned["status"] == "error"
+    assert planned["error"]["code"] == "BUILD_UNAVAILABLE"
+    assert plan_count(database) == 0
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_revision_is_applied_before_plan_and_execution_fingerprints(tmp_path: Path) -> None:
+    project, sha = make_project(tmp_path / "projects")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        allow_simulation=True,
+        apps={
+            "demo": {
+                "git": {
+                    "repo_path": str(project),
+                    "origin": "https://example.invalid/drawbridge.git",
+                    "allowed_ref_patterns": [r"^refs/heads/main$"],
+                },
+                "environments": {
+                    "staging": {
+                        "project_name": "drawbridge-demo-staging",
+                        "deployment_mode": "simulation",
+                        "editable_files": [
+                            {"alias": "compose", "path": "compose.yaml", "display": "yaml"},
+                        ],
+                    }
+                },
+            }
+        },
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    service = DrawbridgeService(settings, database, base_dir=tmp_path)
+    registered = await service.app_register(
+        app="demo",
+        environment="staging",
+        project_dir=str(project),
+        compose_file="compose.yaml",
+        idempotency_key="register-revision-plan-001",
+    )
+    initial_revision = registered["data"]["current_revision"]
+    patched = await service.workspace_patch(
+        app="demo",
+        environment="staging",
+        file_alias="compose",
+        patch={"services": {"app": {"command": ["sleep", "45"]}}},
+        expected_revision=initial_revision,
+        base_commit_sha=sha,
+        idempotency_key="patch-revision-plan-001",
+    )
+    revision_id = patched["data"]["revision_id"]
+    planned = await service.release_plan(
+        app="demo",
+        environment="staging",
+        source_mode="local",
+        git_ref="refs/heads/main",
+        workspace_revision=revision_id,
+    )
+    assert planned["status"] == "ok"
+    stored_plan = await database.get_plan(planned["data"]["plan_id"])
+    assert stored_plan is not None
+    assert stored_plan["workspace_revision"] == revision_id
+    assert stored_plan["workspace_revision_digest"]
+
+    tampered = await service.release_plan(
+        app="demo",
+        environment="staging",
+        source_mode="local",
+        git_ref="refs/heads/main",
+        workspace_revision=revision_id,
+    )
+    mutate_plan(database, tampered["data"]["plan_id"], "workspace_revision_digest", "2" * 64)
+    tampered_apply = await service.release_apply(
+        plan_id=tampered["data"]["plan_id"],
+        idempotency_key="apply-tampered-revision-001",
+    )
+    await service.run_one_job()
+    tampered_status = await service.release_status(tampered_apply["data"]["job_id"])
+    assert tampered_status["data"]["status"] == "failed"
+    assert tampered_status["data"]["error_code"] == "STALE_PLAN"
+    assert "workspace_revision_digest" in tampered_status["data"]["message"]
+    assert await database.get_current_release("demo", "staging") is None
+
+    applied = await service.release_apply(
+        plan_id=planned["data"]["plan_id"],
+        idempotency_key="apply-revision-plan-001",
+    )
+    await service.run_one_job()
+    status = await service.release_status(applied["data"]["job_id"])
+    assert status["data"]["status"] == "succeeded"
+    current = await database.get_current_release("demo", "staging")
+    assert current is not None
+    deployed = yaml.safe_load(Path(current["compose_file"]).read_text(encoding="utf-8"))
+    assert deployed["services"]["app"]["command"] == ["sleep", "45"]
     await database.close()
 
 
@@ -299,24 +739,9 @@ async def test_release_snapshot_revalidates_volumes_before_executor(tmp_path: Pa
     planned = await service.release_plan(
         app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
     )
-    assert planned["status"] == "ok"
-
-    seen: list[ExecutionSpec] = []
-
-    async def execute(spec: ExecutionSpec) -> ExecutionResult:
-        seen.append(spec)
-        raise AssertionError("unsafe snapshot must fail before external execution")
-
-    service.executor.execute = execute
-    applied = await service.release_apply(plan_id=planned["data"]["plan_id"], idempotency_key="apply-snapshot-001")
-    assert applied["status"] == "ok"
-    await service.run_one_job()
-    status = await service.release_status(applied["data"]["job_id"])
-
-    assert status["status"] == "ok"
-    assert status["data"]["status"] == "failed"
-    assert status["data"]["error_code"] == "INVALID_PARAMETER"
-    assert seen == []
+    assert planned["status"] == "error"
+    assert planned["error"]["code"] == "INVALID_PARAMETER"
+    assert "parent traversal" in planned["error"]["message"]
     await database.close()
 
 
@@ -354,24 +779,9 @@ async def test_release_snapshot_revalidates_host_capabilities_before_executor(tm
     planned = await service.release_plan(
         app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
     )
-    assert planned["status"] == "ok"
-
-    seen: list[ExecutionSpec] = []
-
-    async def execute(spec: ExecutionSpec) -> ExecutionResult:
-        seen.append(spec)
-        raise AssertionError("unsafe snapshot must fail before external execution")
-
-    service.executor.execute = execute
-    applied = await service.release_apply(plan_id=planned["data"]["plan_id"], idempotency_key="apply-capability-001")
-    assert applied["status"] == "ok"
-    await service.run_one_job()
-    status = await service.release_status(applied["data"]["job_id"])
-
-    assert status["data"]["status"] == "failed"
-    assert status["data"]["error_code"] == "INVALID_PARAMETER"
-    assert "volumes_from" in status["data"]["message"]
-    assert seen == []
+    assert planned["status"] == "error"
+    assert planned["error"]["code"] == "INVALID_PARAMETER"
+    assert "volumes_from" in planned["error"]["message"]
     await database.close()
 
 
@@ -696,15 +1106,9 @@ async def test_trusted_compose_prefers_existing_image_over_build(
         changed_plan = await service.release_plan(
             app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
         )
-        changed_apply = await service.release_apply(
-            plan_id=changed_plan["data"]["plan_id"], idempotency_key="apply-trusted-changed-001"
-        )
-        await service.run_one_job()
-        changed_status = await service.release_status(changed_apply["data"]["job_id"])
-
-        assert changed_status["data"]["status"] == "failed"
-        assert changed_status["data"]["error_code"] == "INVALID_PARAMETER"
-        assert "digest is not approved" in changed_status["data"]["message"]
+        assert changed_plan["status"] == "error"
+        assert changed_plan["error"]["code"] == "INVALID_PARAMETER"
+        assert "digest is not approved" in changed_plan["error"]["message"]
         assert seen == []
     finally:
         await database.close()

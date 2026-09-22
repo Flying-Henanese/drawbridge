@@ -189,7 +189,7 @@ Runtime Module 首版可以只有 Compose adapter；在真正需要 Kubernetes �
 |---|---|---|---|
 | `ops_status` | `ops:read` | `environment`, 可选 `app` | CPU/内存/磁盘、服务健康、当前 release、关键端口；不含进程命令行和 secrets |
 | `ops_logs` | `logs:read` | `environment`, `app`, `service`（登记名称）, 可选 `since_seconds`, `query`, `cursor`, `limit<=200`（默认 100） | 脱敏日志行、下一 cursor、截断标记 |
-| `ops_release_plan` | 后续 `deploy:plan` | `environment`, `app`, `source_mode=fetch/local`, `git_ref`, 可选 `workspace_revision`, `workflow` | 完整 SHA、冻结 revision、基线、配置摘要、影响服务、步骤、plan_id 和过期时间 |
+| `ops_release_plan` | 后续 `deploy:plan` | `environment`, `app`, `source_mode=fetch/local`, `git_ref`, 可选 `workspace_revision`, `workflow` | 完整 SHA、冻结 revision、基线、来自冻结快照的服务集合、Compose/build 摘要、plan_id 和过期时间 |
 | `ops_release_apply` | 后续部署权限 | `plan_id`, `idempotency_key` | 异步 `job_id`；不会接受命令字符串 |
 | `ops_release_status` | `ops:read` | `job_id` 或 `release_id` | 阶段、结构化进度、健康结果、可安全展示的错误 |
 | `ops_test` | 后续 `test:run` | `release_id`, `suite`（登记名称）, `idempotency_key` | 测试 job 与证据；核实目标版本并取得环境锁 |

@@ -23,8 +23,11 @@ Gateway 与 Runner 通过共享 SQLite 队列协作，这条受控通路则像�
 - 真实 Docker 路径可使用服务器已有镜像，也可对已登记的 `build:` 服务通过独立的
   rootless BuildKit socket 构建。Runner 导入构建产物并用实际镜像 ID 执行
   `docker compose up --no-build --pull never`；构建目录和 Dockerfile 必须匹配管理员 profile。
-- 已完成的 t4 验证是 simulation 验证；真实 Docker 部署尚未在该记录中验收。
-  参见 [docs/VERIFICATION_RECORD.md](docs/VERIFICATION_RECORD.md)。
+- 发布计划先从解析后的完整 Git SHA 创建临时快照，在应用显式 workspace revision 后校验
+  Compose、服务集合和 build 声明。Runner 从同一 SHA 重建最终快照并核对指纹；分支前进或
+  未提交的工作区修改不会改变已有计划。
+- t4 已完成可信 Compose 使用预建镜像的真实 Docker 验证；完整 BuildKit、回滚和中断恢复
+  仍未验收。参见 [docs/VERIFICATION_RECORD.md](docs/VERIFICATION_RECORD.md)。
 
 ## 本地验证
 

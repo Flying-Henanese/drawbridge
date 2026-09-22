@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -23,7 +25,7 @@ from .compose import (
     parse_compose,
     write_trusted_compose,
 )
-from .config import AppConfig, EnvironmentConfig, Settings
+from .config import AppConfig, BuildProfile, EnvironmentConfig, Settings
 from .errors import DrawbridgeError, error_response, ok
 from .gitops import GitError, GitRepository
 from .models import (
@@ -35,6 +37,14 @@ from .models import (
 )
 from .process import ExecutionSpec, SafeExecutor
 from .storage import Database, IdempotencyConflict, JobRecord, QueueFull, create_request_hash
+
+_PLAN_SCHEMA_VERSION = 1
+_PLAN_SNAPSHOT_FIELDS = (
+    "workspace_revision_digest",
+    "service_set",
+    "compose_digest",
+    "build_declaration_digest",
+)
 
 
 class DrawbridgeService:
@@ -371,34 +381,41 @@ class DrawbridgeService:
                 commit_sha = git.fetch_and_resolve(request.git_ref)
             else:
                 commit_sha = git.resolve_commit(request.git_ref)
-            revision = None
-            if request.workspace_revision:
-                revision = await self.database.get_revision(request.workspace_revision)
-                if revision is None or revision["app"] != request.app or revision["environment"] != request.environment:
-                    raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision does not belong to the target")
-                if revision["base_commit_sha"] != commit_sha:
-                    raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision is based on a different commit")
             current = await self.database.get_current_release(request.app, request.environment)
-            service_set = list(binding["services"])
-            if current is not None and sorted(current.get("services", [])) != sorted(service_set):
-                raise DrawbridgeError("UNSUPPORTED_SERVICE_CHANGE", "service topology changed from the fixed baseline")
             profile = self.settings.build_profiles.get(binding["profile"])
             if profile is None:
                 raise DrawbridgeError("APP_NOT_DEPLOYABLE", "registered build profile is unavailable")
+            plan_root = self.settings.resolved_state_dir(self.base_dir) / "plan-snapshots"
+            plan_root.mkdir(parents=True, exist_ok=True)
+            temporary_root = Path(tempfile.mkdtemp(prefix="snapshot-", dir=plan_root))
+            try:
+                snapshot = await self._prepare_snapshot(
+                    commit_sha=commit_sha,
+                    binding=binding,
+                    revision_id=request.workspace_revision,
+                    destination=temporary_root / "source",
+                    archive_path=temporary_root / "source.tar",
+                    profile=profile,
+                    current=current,
+                )
+                fingerprint = self._snapshot_fingerprint(snapshot["compose"], snapshot["revision"], profile)
+            finally:
+                shutil.rmtree(temporary_root, ignore_errors=True)
             plan_id = str(uuid.uuid4())
             expires_at = time.time() + 15 * 60
             payload = {
+                "plan_schema_version": _PLAN_SCHEMA_VERSION,
                 "commit_sha": commit_sha,
                 "git_ref": request.git_ref,
                 "source_mode": request.source_mode,
                 "workspace_revision": request.workspace_revision,
+                **fingerprint,
                 "binding_version": binding["version"],
-                "service_set": service_set,
                 "baseline_release_id": current["release_id"] if current else None,
                 "workflow": request.workflow,
                 "compose_file": binding["compose_file"],
                 "project_name": binding["project_name"],
-                "configuration_digest": self._digest(binding),
+                "configuration_digest": self._configuration_digest(binding),
                 "build_profile_digest": self._digest(profile.model_dump()),
             }
             await self.database.save_plan(
@@ -422,9 +439,11 @@ class DrawbridgeService:
                     "commit_sha": commit_sha,
                     "workspace_revision": request.workspace_revision,
                     "baseline_release_id": current["release_id"] if current else None,
-                    "services": service_set,
+                    "services": fingerprint["service_set"],
                     "expires_at": expires_at,
                     "workflow": request.workflow,
+                    "compose_digest": fingerprint["compose_digest"],
+                    "build_declaration_digest": fingerprint["build_declaration_digest"],
                 },
                 request_id=request_id,
             )
@@ -441,6 +460,7 @@ class DrawbridgeService:
             plan = await self.database.get_plan(plan_id)
             if plan is None:
                 raise DrawbridgeError("STALE_PLAN", "plan does not exist")
+            self._validate_plan_schema(plan)
             existing_job = await self.database.get_job_by_plan(plan_id)
             if existing_job is not None:
                 return ok(
@@ -453,8 +473,14 @@ class DrawbridgeService:
             binding = await self._require_binding(plan["app"], plan["environment"])
             if binding["version"] != plan["binding_version"]:
                 raise DrawbridgeError("STALE_PLAN", "binding changed after plan creation", retryable=True)
+            if self._configuration_digest(binding) != plan.get("configuration_digest"):
+                raise DrawbridgeError("STALE_PLAN", "configuration_digest changed after plan creation", retryable=True)
+            profile = self.settings.build_profiles.get(binding["profile"])
+            if profile is None or self._digest(profile.model_dump()) != plan.get("build_profile_digest"):
+                raise DrawbridgeError("STALE_PLAN", "build_profile_digest changed after plan creation", retryable=True)
             current = await self.database.get_current_release(plan["app"], plan["environment"])
-            if current and current["release_id"] != plan.get("baseline_release_id"):
+            current_release_id = current["release_id"] if current else None
+            if current_release_id != plan.get("baseline_release_id"):
                 raise DrawbridgeError("STALE_PLAN", "a newer release is already active", retryable=True)
             now = time.time()
             if current and self.settings.concurrency.min_deploy_interval_seconds:
@@ -889,18 +915,35 @@ class DrawbridgeService:
 
     async def _execute_deploy(self, job: JobRecord) -> dict[str, Any]:
         plan = job.payload
+        self._validate_plan_schema(plan)
         binding = await self._require_binding(plan["app"], plan["environment"])
         if binding["version"] != plan["binding_version"]:
             raise DrawbridgeError("STALE_PLAN", "binding changed before dispatch", retryable=True)
+        if self._configuration_digest(binding) != plan.get("configuration_digest"):
+            raise DrawbridgeError("STALE_PLAN", "configuration_digest changed before dispatch", retryable=True)
+        profile = self.settings.build_profiles.get(binding["profile"])
+        if profile is None or self._digest(profile.model_dump()) != plan.get("build_profile_digest"):
+            raise DrawbridgeError("STALE_PLAN", "build_profile_digest changed before dispatch", retryable=True)
         current = await self.database.get_current_release(plan["app"], plan["environment"])
-        if current and current["release_id"] != plan.get("baseline_release_id"):
+        current_release_id = current["release_id"] if current else None
+        if current_release_id != plan.get("baseline_release_id"):
             raise DrawbridgeError("STALE_PLAN", "current release changed before dispatch", retryable=True)
         release_id = str(uuid.uuid4())
         release_root = Path(binding["release_root"])
         release_dir = release_root / release_id
         release_dir.parent.mkdir(parents=True, exist_ok=True)
         try:
-            snapshot = await self._create_release_snapshot(plan, binding, release_id, release_dir)
+            snapshot = await self._prepare_snapshot(
+                commit_sha=plan["commit_sha"],
+                binding=binding,
+                revision_id=plan.get("workspace_revision"),
+                destination=release_dir,
+                archive_path=release_dir.parent / f".{release_id}.tar",
+                profile=profile,
+                current=current,
+            )
+            fingerprint = self._snapshot_fingerprint(snapshot["compose"], snapshot["revision"], profile)
+            self._compare_snapshot_fingerprint(plan, fingerprint)
             if binding["deployment_mode"] == "simulation":
                 if not self.settings.allow_simulation:
                     raise DrawbridgeError("APP_NOT_DEPLOYABLE", "simulation mode is disabled")
@@ -944,43 +987,70 @@ class DrawbridgeService:
         )
         return {"release_id": release_id, "status": "succeeded", **release_payload}
 
-    async def _create_release_snapshot(
+    async def _prepare_snapshot(
         self,
-        plan: dict[str, Any],
+        *,
+        commit_sha: str,
         binding: dict[str, Any],
-        release_id: str,
-        release_dir: Path,
+        revision_id: str | None,
+        destination: Path,
+        archive_path: Path,
+        profile: BuildProfile,
+        current: dict[str, Any] | None,
     ) -> dict[str, Any]:
         repository = self._git_for_binding(binding)
-        archive_path = release_dir.parent / f".{release_id}.tar"
         try:
-            repository.archive(plan["commit_sha"], archive_path)
-            repository.extract_archive(archive_path, release_dir)
+            repository.archive(commit_sha, archive_path)
+            repository.extract_archive(archive_path, destination)
         finally:
             archive_path.unlink(missing_ok=True)
-        revision_id = plan.get("workspace_revision")
+        revision = None
         if revision_id:
             revision = await self.database.get_revision(revision_id)
             if revision is None:
                 raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision disappeared before snapshot")
-            for file_info in revision.get("files", {}).values():
-                relative_path = Path(file_info["path"])
-                target = release_dir / relative_path
+            if revision.get("app") != binding["app"] or revision.get("environment") != binding["environment"]:
+                raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision does not belong to the target")
+            if revision.get("base_commit_sha") != commit_sha:
+                raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision is based on a different commit")
+            files = revision.get("files")
+            if not isinstance(files, dict):
+                raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision overlay is invalid")
+            for file_info in files.values():
+                if not isinstance(file_info, dict):
+                    raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision file is invalid")
+                path_value = file_info.get("path")
+                pre_digest = file_info.get("pre_digest")
+                post_digest = file_info.get("post_digest")
+                if (
+                    not isinstance(path_value, str)
+                    or not isinstance(pre_digest, str)
+                    or not isinstance(post_digest, str)
+                ):
+                    raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision digest fields are invalid")
                 try:
-                    target.relative_to(release_dir)
+                    relative_path = Path(validate_subdir(path_value))
+                except ValueError as exc:
+                    raise DrawbridgeError("PATCH_BASE_MISMATCH", "revision path is invalid") from exc
+                target = destination / relative_path
+                try:
+                    target.relative_to(destination)
                 except ValueError as exc:
                     raise DrawbridgeError("PATCH_BASE_MISMATCH", "revision path escapes release snapshot") from exc
                 self._safe_regular_file(target)
-                if self._sha256(target.read_bytes()) != file_info["pre_digest"]:
+                if self._sha256(target.read_bytes()) != pre_digest:
                     raise DrawbridgeError("PATCH_BASE_MISMATCH", "release archive does not match revision base")
-                content = base64.b64decode(file_info["content_b64"], validate=True)
+                try:
+                    content = base64.b64decode(file_info["content_b64"], validate=True)
+                except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+                    raise DrawbridgeError("PATCH_BASE_MISMATCH", "revision overlay content is invalid") from exc
                 temporary = target.with_name(f".{target.name}.drawbridge-{uuid.uuid4().hex}.tmp")
                 temporary.write_bytes(content)
                 os.replace(temporary, target)
-                if self._sha256(target.read_bytes()) != file_info["post_digest"]:
+                if self._sha256(target.read_bytes()) != post_digest:
                     raise DrawbridgeError("PATCH_BASE_MISMATCH", "revision overlay digest mismatch")
-        release_root = release_dir.resolve()
-        compose_path = (release_dir / binding["compose_file"]).resolve()
+        release_root = destination.resolve()
+        compose_path = (destination / binding["compose_file"]).resolve()
         try:
             compose_path.relative_to(release_root)
         except ValueError as exc:
@@ -990,13 +1060,19 @@ class DrawbridgeService:
         try:
             compose = parse_compose(
                 compose_path,
-                release_dir,
+                destination,
                 allowed_data_mounts=binding.get("data_mounts", []),
                 runtime_profile=binding.get("runtime_profile"),
             )
         except ComposeError as exc:
             raise DrawbridgeError("INVALID_PARAMETER", f"compose validation failed: {exc}") from exc
-        return {"compose": compose, "compose_file": compose_path}
+        self._validate_service_topology(
+            snapshot_services=sorted(compose.services),
+            binding=binding,
+            current=current,
+        )
+        validate_build_declarations(compose, profile)
+        return {"compose": compose, "compose_file": compose_path, "revision": revision}
 
     async def _deploy_docker(
         self, plan: dict[str, Any], binding: dict[str, Any], release_id: str, release_dir: Path, compose: ComposeSpec
@@ -1310,6 +1386,153 @@ class DrawbridgeService:
     def _git_for_binding(self, binding: dict[str, Any]) -> GitRepository:
         return GitRepository(Path(binding["source_workspace"]), binding["origin"], binding["allowed_ref_patterns"])
 
+    def _snapshot_fingerprint(
+        self,
+        compose: ComposeSpec,
+        revision: dict[str, Any] | None,
+        profile: BuildProfile,
+    ) -> dict[str, Any]:
+        build_declarations: dict[str, Any] = {}
+        for service in sorted(compose.build_services):
+            target = profile.targets.get(service) if profile.targets else None
+            if target is None:
+                target = profile
+            build_declarations[service] = {
+                "declaration": compose.raw["services"][service]["build"],
+                "matched_target": {
+                    "context": target.context,
+                    "dockerfile": target.dockerfile,
+                },
+            }
+        return {
+            "workspace_revision_digest": self._workspace_revision_digest(revision),
+            "service_set": sorted(compose.services),
+            "compose_digest": self._digest(compose.raw),
+            "build_declaration_digest": self._digest(build_declarations),
+        }
+
+    def _workspace_revision_digest(self, revision: dict[str, Any] | None) -> str | None:
+        if revision is None:
+            return None
+        files = revision.get("files")
+        if not isinstance(files, dict):
+            raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision overlay is invalid")
+        normalized_files: list[dict[str, str]] = []
+        for file_info in files.values():
+            if not isinstance(file_info, dict):
+                raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision file is invalid")
+            path = file_info.get("path")
+            pre_digest = file_info.get("pre_digest")
+            post_digest = file_info.get("post_digest")
+            if not isinstance(path, str) or not isinstance(pre_digest, str) or not isinstance(post_digest, str):
+                raise DrawbridgeError("PATCH_BASE_MISMATCH", "workspace revision digest fields are invalid")
+            normalized_files.append(
+                {
+                    "path": path,
+                    "pre_digest": pre_digest,
+                    "post_digest": post_digest,
+                }
+            )
+        normalized_files.sort(key=lambda item: item["path"])
+        return self._digest(
+            {
+                "base_commit_sha": revision.get("base_commit_sha"),
+                "files": normalized_files,
+            }
+        )
+
+    def _configuration_digest(self, binding: dict[str, Any]) -> str:
+        fields = (
+            "source_workspace",
+            "compose_file",
+            "origin",
+            "allowed_ref_patterns",
+            "services",
+            "deployment_mode",
+            "project_name",
+            "data_mounts",
+            "runtime_profile_name",
+            "runtime_profile",
+            "health_checks",
+            "release_root",
+            "data_root",
+            "profile",
+        )
+        return self._digest({field: binding.get(field) for field in fields})
+
+    @staticmethod
+    def _validate_service_topology(
+        *,
+        snapshot_services: list[str],
+        binding: dict[str, Any],
+        current: dict[str, Any] | None,
+    ) -> None:
+        registered_services = sorted(binding.get("services", []))
+        if snapshot_services != registered_services:
+            raise DrawbridgeError(
+                "UNSUPPORTED_SERVICE_CHANGE",
+                "snapshot service topology differs from the registered service set",
+            )
+        if current is not None and sorted(current.get("services", [])) != snapshot_services:
+            raise DrawbridgeError(
+                "UNSUPPORTED_SERVICE_CHANGE",
+                "snapshot service topology differs from the current release",
+            )
+
+    @staticmethod
+    def _validate_plan_schema(plan: dict[str, Any]) -> None:
+        if type(plan.get("plan_schema_version")) is not int or plan["plan_schema_version"] != _PLAN_SCHEMA_VERSION:
+            raise DrawbridgeError("STALE_PLAN", "plan_schema_version is missing or unsupported", retryable=True)
+        required = (
+            "commit_sha",
+            "workspace_revision",
+            "workspace_revision_digest",
+            "service_set",
+            "compose_digest",
+            "build_declaration_digest",
+            "binding_version",
+            "configuration_digest",
+            "build_profile_digest",
+        )
+        missing = [field for field in required if field not in plan]
+        if missing:
+            raise DrawbridgeError("STALE_PLAN", f"plan is missing {missing[0]}", retryable=True)
+        if not isinstance(plan["commit_sha"], str) or not re.fullmatch(r"[0-9a-f]{40}", plan["commit_sha"]):
+            raise DrawbridgeError("STALE_PLAN", "plan commit_sha is invalid", retryable=True)
+        revision_id = plan["workspace_revision"]
+        revision_digest = plan["workspace_revision_digest"]
+        if revision_id is None:
+            if revision_digest is not None:
+                raise DrawbridgeError("STALE_PLAN", "workspace_revision_digest is invalid", retryable=True)
+        elif (
+            not isinstance(revision_id, str)
+            or not re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                revision_id,
+            )
+            or not DrawbridgeService._is_sha256(revision_digest)
+        ):
+            raise DrawbridgeError("STALE_PLAN", "workspace revision fields are invalid", retryable=True)
+        service_set = plan["service_set"]
+        if (
+            not isinstance(service_set, list)
+            or not service_set
+            or any(not isinstance(service, str) for service in service_set)
+            or service_set != sorted(set(service_set))
+        ):
+            raise DrawbridgeError("STALE_PLAN", "plan service_set is invalid", retryable=True)
+        for field in ("compose_digest", "build_declaration_digest", "configuration_digest", "build_profile_digest"):
+            if not DrawbridgeService._is_sha256(plan[field]):
+                raise DrawbridgeError("STALE_PLAN", f"plan {field} is invalid", retryable=True)
+        if type(plan["binding_version"]) is not int or plan["binding_version"] < 1:
+            raise DrawbridgeError("STALE_PLAN", "plan binding_version is invalid", retryable=True)
+
+    @staticmethod
+    def _compare_snapshot_fingerprint(plan: dict[str, Any], fingerprint: dict[str, Any]) -> None:
+        for field in _PLAN_SNAPSHOT_FIELDS:
+            if plan.get(field) != fingerprint.get(field):
+                raise DrawbridgeError("STALE_PLAN", f"{field} changed after plan creation", retryable=True)
+
     def _default_ref_patterns(self) -> list[str]:
         return [
             r"^refs/heads/main$",
@@ -1455,8 +1678,21 @@ class DrawbridgeService:
         return hashlib.sha256(value).hexdigest()
 
     @staticmethod
+    def _is_sha256(value: Any) -> bool:
+        return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
+
+    @staticmethod
     def _digest(value: Any) -> str:
-        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        try:
+            encoded = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise DrawbridgeError("INVALID_PARAMETER", "validated configuration cannot be normalized") from exc
+        return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
     def _redact(value: str) -> str:

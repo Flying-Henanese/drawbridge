@@ -31,6 +31,17 @@ Git 仓库；其镜像地址为不可用的 `example.invalid`。状态、日志�
 指向临时目录。运行不会拉取镜像、构建镜像、启动容器或更改现有部署。临时输入结束时
 清理，报告和日志保留在本地证据目录。
 
+## 聚焦验证
+
+完整 harness 是交付门槛，但不会替代与改动直接相关的边界测试。发布计划和冻结快照相关
+改动至少应在 `tests/test_service.py` 覆盖以下路径：
+
+- 计划阶段从固定 SHA 的临时快照校验 Compose，并在无效快照时不保存 plan。
+- Runner 拒绝旧 schema、binding/profile/基线变化和任一快照指纹漂移，且不触发外部副作用。
+- 分支在计划后前移、工作区文件变化或 `current_revision` 改变时，执行仍只使用计划保存的
+  commit 和显式 revision。
+- 固定服务集合发生新增、删除或改名时，计划或执行明确失败。
+
 ## 真实服务器验收
 
 本地报告不能证明 Gateway 的网络监听、客户端直连、systemd 用户权限、rootless
@@ -38,6 +49,11 @@ BuildKit、Docker image load、Compose 更新、设备访问或业务健康状�
 [OPERATIONS.md](../../docs/OPERATIONS.md)，在目标服务器以管理员批准的配置执行自检，
 再对获准项目运行实际的 register → plan → apply → status，并检查构建日志、release
 制品、容器状态和业务请求。
+
+任务 02 已在 t4 对 ContractLens 做过一次额外验收：计划冻结提交后推进分支并临时破坏
+工作区 Compose，Runner 仍从冻结 SHA 发布；该项目按可信配置复用已有镜像，发布命令使用
+`--no-build --pull never`，最终三个业务容器健康且 HTTP 检查成功。这项历史证据没有运行
+BuildKit，也不覆盖自动回滚、Runner 中断恢复、严格进程权限或其他项目。
 
 [VERIFICATION_RECORD.md](../../docs/VERIFICATION_RECORD.md) 保存以往本地和 t4 的结果，
 是历史证据，不是当前服务器的就绪标志。报告本次结果时写明环境、时间、报告路径和
