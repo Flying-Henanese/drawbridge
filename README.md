@@ -4,6 +4,18 @@ Drawbridge 是用于部署和运行观测的 MCP 服务。它由两个 Python �
 `/mcp` 提供 Streamable HTTP 接口，Runner 从共享 SQLite 队列执行任务；Drawbridge
 自身不是一个 Docker Compose 应用。下文是 Linux 服务器上的安装、启停和接入流程。
 
+## 设计灵感：来自《死亡搁浅》的“棒与绳”
+
+Drawbridge 的这个设计灵感来自小岛秀夫的《死亡搁浅》，其中“棒与绳”的意象源自安部公房
+作品：棒让人和威胁保持距离，绳把珍视之物连接起来。对 Drawbridge 来说，Gateway 承担“棒”
+的作用，在 MCP 客户端与服务器部署能力之间建立边界：它校验请求来源，只开放登记好的操作，
+不把任意 Shell 或 Docker 命令交给客户端。
+
+Gateway 与 Runner 通过共享 SQLite 队列协作，这条受控通路则像“绳”：Gateway 把获准的
+变更请求写入队列，Runner 执行后写回结果，客户端再通过 Gateway 查询状态。这样，智能体可以
+连接并操作远端服务，而不需要直接持有宿主机的任意执行权限。Gateway 仍会处理部分 Git 操作
+和 Docker 只读查询；实际构建与 Compose 变更由 Runner 执行。
+
 ## 当前能力边界
 
 - `config.example.yaml` 默认启用 **simulation**：可以验证注册、计划、排队和发布记录，
