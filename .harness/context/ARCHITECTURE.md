@@ -105,9 +105,9 @@ API；多语句状态转换在锁内使用短 `BEGIN IMMEDIATE` 事务。Gateway
 - 计划阶段和 Runner 使用同一套快照准备与指纹计算原语。计划只能从冻结 SHA 和显式
   revision 生成；旧 schema、服务拓扑变化或任一冻结指纹不一致时必须返回 `STALE_PLAN`，
   并在 BuildKit、Docker、simulation release 等外部副作用前停止。
-- 队列容量检查、幂等键与 job 插入位于同一事务；job 认领以条件更新保证唯一。成功部署或
-  simulation 回滚的 release、成功事件和 job 终态也在一个事务提交。Git、BuildKit、Docker
-  和 HTTP 等外部操作不在 SQLite 事务中执行。
+- 队列容量检查、幂等键与 job 插入位于同一事务；job 认领以条件更新保证唯一。成功部署的
+  release、成功事件和 job 终态在一个事务提交；simulation 回滚的 release 和 job 终态也在
+  一个事务提交。Git、BuildKit、Docker 和 HTTP 等外部操作不在 SQLite 事务中执行。
 - HTTP 检查有目标 CIDR、端口、方法及响应大小限制；读请求可直接返回，写请求入队。
   诊断输出和日志有边界与脱敏处理。
 - 本地 `config.example.yaml` 开启 simulation；真实 Docker 构建与部署需要独立的服务器

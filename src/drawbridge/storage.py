@@ -74,6 +74,20 @@ class EnqueueResult:
     created: bool
 
 
+@dataclass(frozen=True)
+class ReleaseJobCompletion:
+    job_id: str
+    result: dict[str, Any]
+    release_id: str
+    app: str
+    environment: str
+    release_payload: dict[str, Any]
+    release_status: str = "succeeded"
+    replaces_release_id: str | None = None
+    restored_from_release_id: str | None = None
+    event_type: str | None = None
+
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
@@ -390,54 +404,69 @@ class Database:
                 (status, now, now, json.dumps(result, sort_keys=True, ensure_ascii=False), job_id),
             )
 
-    async def complete_job_with_release(
-        self,
+    @staticmethod
+    async def _insert_release(
+        connection: aiosqlite.Connection,
         *,
-        job_id: str,
-        result: dict[str, Any],
         release_id: str,
         app: str,
         environment: str,
-        release_payload: dict[str, Any],
-        release_status: str = "succeeded",
-        replaces_release_id: str | None = None,
-        restored_from_release_id: str | None = None,
-        event_type: str | None = None,
+        payload: dict[str, Any],
+        status: str,
+        created_at: float,
+        replaces_release_id: str | None,
+        restored_from_release_id: str | None,
+    ) -> None:
+        await connection.execute(
+            "INSERT INTO releases VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                release_id,
+                app,
+                environment,
+                status,
+                json.dumps(payload, sort_keys=True),
+                created_at,
+                replaces_release_id,
+                restored_from_release_id,
+            ),
+        )
+
+    async def complete_job_with_release(
+        self,
+        completion: ReleaseJobCompletion,
     ) -> None:
         async with self._transaction() as connection:
             now = time.time()
-            await connection.execute(
-                "INSERT INTO releases VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    release_id,
-                    app,
-                    environment,
-                    release_status,
-                    json.dumps(release_payload, sort_keys=True),
-                    now,
-                    replaces_release_id,
-                    restored_from_release_id,
-                ),
+            await self._insert_release(
+                connection,
+                release_id=completion.release_id,
+                app=completion.app,
+                environment=completion.environment,
+                payload=completion.release_payload,
+                status=completion.release_status,
+                created_at=now,
+                replaces_release_id=completion.replaces_release_id,
+                restored_from_release_id=completion.restored_from_release_id,
             )
-            if event_type is not None:
+            if completion.event_type is not None:
                 await connection.execute(
                     "INSERT INTO events(event_id, created_at, request_id, event_type, app, environment, "
                     "job_id, plan_id, release_id, payload) VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?)",
                     (
                         str(uuid.uuid4()),
                         now,
-                        event_type,
-                        app,
-                        environment,
-                        job_id,
-                        release_id,
-                        json.dumps(release_payload, sort_keys=True),
+                        completion.event_type,
+                        completion.app,
+                        completion.environment,
+                        completion.job_id,
+                        completion.release_id,
+                        json.dumps(completion.release_payload, sort_keys=True),
                     ),
                 )
             cursor = await connection.execute(
                 "UPDATE jobs SET status = 'succeeded', finished_at = ?, heartbeat_at = ?, result = ? "
                 "WHERE job_id = ? AND status = 'running'",
-                (now, now, json.dumps(result, sort_keys=True, ensure_ascii=False), job_id),
+                (now, now, json.dumps(completion.result, sort_keys=True, ensure_ascii=False), completion.job_id),
             )
             try:
                 completed_count = cursor.rowcount
@@ -578,18 +607,16 @@ class Database:
         restored_from_release_id: str | None = None,
     ) -> None:
         async with self._transaction() as connection:
-            await connection.execute(
-                "INSERT INTO releases VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    release_id,
-                    app,
-                    environment,
-                    status,
-                    json.dumps(payload, sort_keys=True),
-                    time.time(),
-                    replaces_release_id,
-                    restored_from_release_id,
-                ),
+            await self._insert_release(
+                connection,
+                release_id=release_id,
+                app=app,
+                environment=environment,
+                payload=payload,
+                status=status,
+                created_at=time.time(),
+                replaces_release_id=replaces_release_id,
+                restored_from_release_id=restored_from_release_id,
             )
 
     async def get_release(self, release_id: str) -> dict[str, Any] | None:

@@ -496,8 +496,8 @@ def create_app(config_path: Path) -> Any:
 
     @asynccontextmanager
     async def lifespan(application: Any) -> AsyncIterator[Any]:
-        await database.initialize()
         try:
+            await database.initialize()
             async with session_lifespan(application) as state:
                 yield state
         finally:

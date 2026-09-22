@@ -3,9 +3,17 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
-from drawbridge.storage import Database, IdempotencyConflict, QueueFull, StorageError, create_request_hash
+from drawbridge.storage import (
+    Database,
+    IdempotencyConflict,
+    QueueFull,
+    ReleaseJobCompletion,
+    StorageError,
+    create_request_hash,
+)
 
 
 @pytest.mark.asyncio
@@ -390,13 +398,15 @@ async def test_release_and_successful_job_are_committed_together(tmp_path: Path)
     assert claimed is not None
 
     await database.complete_job_with_release(
-        job_id=queued.job_id,
-        result={"release_id": "release-1", "status": "succeeded"},
-        release_id="release-1",
-        app="demo",
-        environment="staging",
-        release_payload={"source_sha": "a" * 40},
-        event_type="release_succeeded",
+        ReleaseJobCompletion(
+            job_id=queued.job_id,
+            result={"release_id": "release-1", "status": "succeeded"},
+            release_id="release-1",
+            app="demo",
+            environment="staging",
+            release_payload={"source_sha": "a" * 40},
+            event_type="release_succeeded",
+        )
     )
 
     job = await database.get_job(queued.job_id)
@@ -406,6 +416,11 @@ async def test_release_and_successful_job_are_committed_together(tmp_path: Path)
     assert job.result == {"release_id": "release-1", "status": "succeeded"}
     assert release is not None
     assert release["source_sha"] == "a" * 40
+    async with aiosqlite.connect(database.path) as connection:
+        cursor = await connection.execute("SELECT event_type FROM events WHERE job_id = ?", (queued.job_id,))
+        events = await cursor.fetchall()
+        await cursor.close()
+    assert events == [("release_succeeded",)]
     await database.close()
 
 
@@ -416,13 +431,21 @@ async def test_release_is_rolled_back_when_job_cannot_be_completed(tmp_path: Pat
 
     with pytest.raises(StorageError, match="running job"):
         await database.complete_job_with_release(
-            job_id="missing-job",
-            result={"release_id": "release-1", "status": "succeeded"},
-            release_id="release-1",
-            app="demo",
-            environment="staging",
-            release_payload={"source_sha": "a" * 40},
+            ReleaseJobCompletion(
+                job_id="missing-job",
+                result={"release_id": "release-1", "status": "succeeded"},
+                release_id="release-1",
+                app="demo",
+                environment="staging",
+                release_payload={"source_sha": "a" * 40},
+                event_type="release_succeeded",
+            )
         )
 
     assert await database.get_release("release-1") is None
+    async with aiosqlite.connect(database.path) as connection:
+        cursor = await connection.execute("SELECT COUNT(*) FROM events WHERE job_id = 'missing-job'")
+        event_count = await cursor.fetchone()
+        await cursor.close()
+    assert event_count == (0,)
     await database.close()

@@ -438,6 +438,6 @@ simulation 回滚现在把 release、可选成功事件和 job 终态一次提�
 以及 8 个并发 MCP 工具调用只初始化一次 schema。
 
 本地 macOS arm64、Python 3.14.5 完整执行 `.venv/bin/python scripts/verify.py`，报告位于
-`var/verification/20260922T064536Z/report.json`，`result: passed`；Ruff、格式、mypy、编译、
+`var/verification/20260922T065404Z/report.json`，`result: passed`；Ruff、格式、mypy、编译、
 78 个 pytest、隔离 self-check 与 simulation 全部通过。本地结果没有覆盖 t4 上两个 systemd
 进程对同一 SQLite 文件的实际协作，服务器验证另行记录。

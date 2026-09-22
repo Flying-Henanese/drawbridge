@@ -36,7 +36,14 @@ from .models import (
     validate_subdir,
 )
 from .process import ExecutionSpec, SafeExecutor
-from .storage import Database, IdempotencyConflict, JobRecord, QueueFull, create_request_hash
+from .storage import (
+    Database,
+    IdempotencyConflict,
+    JobRecord,
+    QueueFull,
+    ReleaseJobCompletion,
+    create_request_hash,
+)
 
 _PLAN_SCHEMA_VERSION = 1
 _PLAN_SNAPSHOT_FIELDS = (
@@ -888,21 +895,18 @@ class DrawbridgeService:
         if job is None:
             return None
         try:
-            completed_in_handler = False
             if job.action == "deploy":
-                result = await self._execute_deploy(job)
-                completed_in_handler = True
+                await self._execute_deploy(job)
             elif job.action == "rollback":
-                result = await self._execute_rollback(job)
-                completed_in_handler = True
+                await self._execute_rollback(job)
             elif job.action == "restart":
                 result = await self._execute_restart(job)
+                await self.database.finish_job(job.job_id, status="succeeded", result=result)
             elif job.action == "http_request":
                 result = await self._execute_http_job(job)
+                await self.database.finish_job(job.job_id, status="succeeded", result=result)
             else:
                 raise DrawbridgeError("UNKNOWN_OPERATION", f"unsupported queued action: {job.action}")
-            if not completed_in_handler:
-                await self.database.finish_job(job.job_id, status="succeeded", result=result)
         except DrawbridgeError as exc:
             await self.database.finish_job(
                 job.job_id,
@@ -977,13 +981,15 @@ class DrawbridgeService:
             raise
         result = {"release_id": release_id, "status": "succeeded", **release_payload}
         await self.database.complete_job_with_release(
-            job_id=job.job_id,
-            result=result,
-            release_id=release_id,
-            app=plan["app"],
-            environment=plan["environment"],
-            release_payload=release_payload,
-            event_type="release_succeeded",
+            ReleaseJobCompletion(
+                job_id=job.job_id,
+                result=result,
+                release_id=release_id,
+                app=plan["app"],
+                environment=plan["environment"],
+                release_payload=release_payload,
+                event_type="release_succeeded",
+            )
         )
         return result
 
@@ -1168,14 +1174,16 @@ class DrawbridgeService:
             "replaces_release_id": current["release_id"],
         }
         await self.database.complete_job_with_release(
-            job_id=job.job_id,
-            result=result,
-            release_id=release_id,
-            app=job.app or "",
-            environment=job.environment or "staging",
-            release_payload=payload,
-            replaces_release_id=current["release_id"],
-            restored_from_release_id=target["release_id"],
+            ReleaseJobCompletion(
+                job_id=job.job_id,
+                result=result,
+                release_id=release_id,
+                app=job.app or "",
+                environment=job.environment or "staging",
+                release_payload=payload,
+                replaces_release_id=current["release_id"],
+                restored_from_release_id=target["release_id"],
+            )
         )
         return result
 
