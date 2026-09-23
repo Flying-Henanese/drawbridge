@@ -146,6 +146,10 @@ Gateway 在 `source_mode: fetch` 的计划路径中需要写登记仓库，所�
   [docs/OPERATIONS.md](docs/OPERATIONS.md)。`self-check` 检查构建工具和 socket，
   仍须单独完成真实的构建、导入、Compose 和健康检查验收。
 
+如果应用先以 `simulation` 注册，之后改为 `docker`，修改 Gateway/Runner 配置并重启后，
+还需重新调用 `ops_app_register` 刷新 SQLite 中的 binding。更新会递增版本，旧 plan
+失效，部署前须重新创建 plan。
+
 在启动前分别**以对应服务用户**执行自检，并查看 JSON 中的 `ok` 和每一项
 `blocking`/`ok`，不能仅凭命令退出码判断：
 

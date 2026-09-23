@@ -18,7 +18,9 @@
 
 1. **注册**：尚未绑定时调用 `ops_app_register(app, project_dir, compose_file,
    idempotency_key, profile)`。管理员模式的 `compose_file` 须与管理员配置的入口文件名一致。
-   服务端检查路径、Git、Compose 和构建声明，并记录绑定。
+   服务端检查路径、Git、Compose 和构建声明，并记录绑定。若此前以 `simulation` 注册，
+   后来把管理员配置改为 `docker`，重启 Gateway/Runner 后还须用新的幂等键重新注册；
+   binding 版本会递增，旧 plan 失效，随后应重新创建 plan。
 2. **计划**：调用 `ops_release_plan(app, git_ref, source_mode)`。`git_ref` 使用完整
    `refs/heads/...`、`refs/tags/...` 或允许的 40 位 SHA；`fetch` 仅接受分支或标签，
    `local` 可使用本地已有提交。若要发布登记过的配置 revision，同时传

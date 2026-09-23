@@ -933,6 +933,82 @@ async def test_reregister_refreshes_admin_runtime_profile_for_same_project(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_reregister_refreshes_deployment_mode_after_config_change(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    config = {
+        "state_dir": str(tmp_path / "state"),
+        "allowed_project_roots": [str(tmp_path / "projects")],
+        "managed_release_root": str(tmp_path / "releases"),
+        "auth": {"mode": "token", "token": "local-test-token"},
+        "allow_simulation": True,
+        "apps": {
+            "demo": {
+                "git": {"repo_path": str(project), "origin": "https://example.invalid/drawbridge.git"},
+                "environments": {
+                    "staging": {"project_name": "drawbridge-demo-staging", "deployment_mode": "simulation"}
+                },
+            }
+        },
+    }
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    try:
+        simulation = DrawbridgeService(Settings.model_validate(config), database, base_dir=tmp_path)
+        first = await simulation.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="compose.yaml",
+            idempotency_key="register-mode-refresh-001",
+        )
+        assert first["status"] == "ok"
+        assert first["data"]["version"] == 1
+        original = await database.get_binding("demo", "staging")
+        assert original is not None
+        assert original["deployment_mode"] == "simulation"
+        old_plan = await simulation.release_plan(
+            app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+        )
+        assert old_plan["status"] == "ok"
+
+        config["apps"]["demo"]["environments"]["staging"]["deployment_mode"] = "docker"
+        docker = DrawbridgeService(Settings.model_validate(config), database, base_dir=tmp_path)
+        refreshed = await docker.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="compose.yaml",
+            idempotency_key="register-mode-refresh-002",
+        )
+        assert refreshed["status"] == "ok"
+        assert refreshed["data"]["version"] == 2
+        binding = await database.get_binding("demo", "staging")
+        assert binding is not None
+        assert binding["deployment_mode"] == "docker"
+        stale = await docker.release_apply(
+            plan_id=old_plan["data"]["plan_id"], idempotency_key="apply-old-mode-plan-001"
+        )
+        assert stale["status"] == "error"
+        assert stale["error"]["code"] == "STALE_PLAN"
+        new_plan = await docker.release_plan(
+            app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+        )
+        assert new_plan["status"] == "ok"
+
+        unchanged = await docker.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="compose.yaml",
+            idempotency_key="register-mode-refresh-003",
+        )
+        assert unchanged["status"] == "ok"
+        assert unchanged["data"]["version"] == 2
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_release_snapshot_revalidates_volumes_before_executor(tmp_path: Path) -> None:
     project, _ = make_project(tmp_path / "projects")
     settings = Settings(

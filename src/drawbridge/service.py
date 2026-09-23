@@ -1746,6 +1746,7 @@ class DrawbridgeService:
     def _runtime_policy_identity(self, binding: dict[str, Any]) -> tuple[Any, ...]:
         return (
             binding.get("compose_file"),
+            binding.get("deployment_mode"),
             binding.get("runtime_profile_name"),
             self._digest(binding.get("runtime_profile")),
             self._digest(binding.get("operator_compose")),

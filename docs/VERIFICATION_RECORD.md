@@ -584,3 +584,17 @@ ContractLens 业务应用。
 `var/verification/20260923T100117Z/report.json`，`result: passed`；Ruff、格式、mypy、
 编译、pytest、隔离 self-check 和 simulation 均通过。该本地结果不消除上述 Docker
 异常失败路径的潜在泄露，也不扩大第 27 节的真实服务器验收范围。
+
+## 29. simulation 绑定切换 Docker 的重新注册（本地验证，2026-09-23）
+
+在 commit `653d07ea67fed74a09486d93cc58ba912077825a` 的工作树上复现：同一 SQLite
+binding 先以 `simulation` 注册，再用 `docker` 配置和新 Service 实例重新注册，返回版本仍为
+1，数据库保留 `simulation`。新增聚焦测试先两次稳定失败于版本断言（期望 2，实际 1）。
+将 `deployment_mode` 纳入注册时的运行策略比较后，该测试通过；同时验证新 binding 为
+`docker`、旧 simulation plan 返回 `STALE_PLAN`、新 plan 可创建、同配置再注册不重复增版。
+
+本地 macOS arm64、Python 3.14.5 执行 `uv sync --frozen --extra dev` 和完整
+`.venv/bin/python scripts/verify.py`，报告为
+`var/verification/20260923T100858Z/report.json`，`result: passed`；Ruff、格式、mypy、
+编译、85 个 pytest、隔离 self-check 和 simulation 均通过。本次未在真实服务器上更新
+Drawbridge 或重新注册已有应用；已有 SQLite binding 仍需在新版本运行后主动重新注册。
