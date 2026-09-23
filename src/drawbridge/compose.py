@@ -98,6 +98,7 @@ def parse_compose(
     *,
     allowed_data_mounts: Sequence[Mapping[str, Any]] | None = None,
     runtime_profile: Mapping[str, Any] | None = None,
+    operator_trusted: bool = False,
 ) -> ComposeSpec:
     if not path.is_absolute():
         path = project_dir / path
@@ -125,7 +126,9 @@ def parse_compose(
 
     normalized_data_mounts = _normalize_data_mounts(allowed_data_mounts or ())
     compose_digest = hashlib.sha256(compose_bytes).hexdigest()
-    policy = _normalize_runtime_profile(runtime_profile or {}, compose_digest=compose_digest)
+    policy = _normalize_runtime_profile(
+        runtime_profile or {}, compose_digest=compose_digest, operator_trusted=operator_trusted
+    )
     if not policy.trusted_compose:
         allowed_root = {"version", "name", "services", "networks", "volumes", "configs", "secrets"}
         unknown_root = set(raw) - allowed_root
@@ -262,7 +265,9 @@ def docker_discover(*, max_items: int = 1000) -> list[dict[str, Any]]:
     return candidates
 
 
-def _normalize_runtime_profile(value: Mapping[str, Any], *, compose_digest: str) -> _RuntimePolicy:
+def _normalize_runtime_profile(
+    value: Mapping[str, Any], *, compose_digest: str, operator_trusted: bool = False
+) -> _RuntimePolicy:
     allowed_keys = {
         "privileged_services",
         "host_mounts",
@@ -346,9 +351,9 @@ def _normalize_runtime_profile(value: Mapping[str, Any], *, compose_digest: str)
         raise ComposeError("runtime profile approved_compose_digests contains an invalid SHA-256 value")
     if type(prefer_prebuilt_images) is not bool:
         raise ComposeError("runtime profile prefer_prebuilt_images must be a boolean")
-    if prefer_prebuilt_images and not approved_values:
+    if prefer_prebuilt_images and not approved_values and not operator_trusted:
         raise ComposeError("runtime profile prefer_prebuilt_images requires approved_compose_digests")
-    trusted_compose = compose_digest in approved_values
+    trusted_compose = operator_trusted or compose_digest in approved_values
     if prefer_prebuilt_images and not trusted_compose:
         raise ComposeError("compose digest is not approved for the prebuilt image policy")
     return _RuntimePolicy(
@@ -357,7 +362,7 @@ def _normalize_runtime_profile(value: Mapping[str, Any], *, compose_digest: str)
         ports=ports,
         device_reservations=device_reservations,
         trusted_compose=trusted_compose,
-        prefer_prebuilt_images=prefer_prebuilt_images,
+        prefer_prebuilt_images=prefer_prebuilt_images or operator_trusted,
     )
 
 

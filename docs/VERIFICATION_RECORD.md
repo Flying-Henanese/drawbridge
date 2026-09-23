@@ -484,3 +484,19 @@ Ruff、格式、mypy、编译、79 个 pytest、隔离 self-check 和 simulation
 `runtime_metadata` 为 `requires_python: >=3.12`、`ruff_target: py312`、
 `mypy_python_version: 3.12`。本次没有在 t4 重启服务或执行真实 Docker/BuildKit 发布；历史
 t4 证据仍是带日期的记录，不代表当前服务器就绪状态。
+
+## 26. 管理员维护 Compose 文件模式（本地验证，2026-09-23）
+
+新增每个应用环境的 `operator_compose` 入口，从管理员只读目录复制 Compose、`.env` 和服务级
+`env_file` 到 Git SHA 对应的发布快照。计划记录这些文件的内容摘要；Runner 重新读取并比较，
+变更后旧计划以 `STALE_PLAN` 终止。管理员模式只使用预建镜像；Runner 从本地 Docker Engine
+解析镜像并用实际镜像 ID 启动，不要求 Gateway 访问 Docker daemon。Git Compose 的摘要批准
+与严格校验路径继续保留。
+
+本地 macOS arm64、Python 3.14.5 执行 `uv sync --frozen --extra dev` 和完整
+`.venv/bin/python scripts/verify.py`，报告位于
+`var/verification/20260923T063927Z/report.json`，`result: passed`；Ruff、格式、mypy、编译、
+**84 个 pytest**、隔离 self-check 和 simulation 均通过。聚焦测试覆盖管理员文件改动后旧计划
+失效、重新计划后发布、Compose 入口文件名刷新、受控目录、相对路径和 MCP 可编辑文件重叠限制，以及用受控执行器
+模拟的 Docker 镜像 ID 固定。此结果没有在 t4 上验收实际管理员目录权限、Docker Compose
+解析、本地镜像运行或业务健康；不代表真实服务器发布就绪。

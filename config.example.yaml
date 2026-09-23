@@ -46,6 +46,8 @@ build_profiles:
 # Runtime profiles are strict by default. An administrator can approve the
 # exact SHA-256 of a legacy Compose file. prefer_prebuilt_images then makes
 # services that declare both image and build use docker compose --no-build.
+# A docker environment may instead set operator_compose.directory and .file to
+# use administrator-owned server files. See README; this example remains simulation.
 runtime_profiles: {}
 allow_simulation: true
 

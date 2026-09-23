@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from drawbridge.compose import ComposeError, parse_compose
-from drawbridge.config import DataMountConfig, Settings
+from drawbridge.config import DataMountConfig, OperatorComposeConfig, Settings
 from drawbridge.models import (
     HttpRequestInput,
     IdempotencyInput,
@@ -16,6 +16,7 @@ from drawbridge.models import (
     validate_ref,
     validate_subdir,
 )
+from drawbridge.operator_files import OperatorFileError, materialize_operator_files
 
 
 def test_release_plan_rejects_extra_fields_and_string_numbers() -> None:
@@ -51,6 +52,33 @@ def test_request_fields_reject_shell_syntax_and_invalid_method() -> None:
 
     valid = HttpRequestInput(url="http://127.0.0.1:8080/health", method="GET")
     assert valid.method == "GET"
+
+
+def test_operator_compose_requires_a_fixed_entry_and_external_directory(tmp_path: Path) -> None:
+    project = tmp_path / "projects" / "demo"
+    project.mkdir(parents=True)
+    (project / "compose.yaml").write_text("services:\n  app:\n    image: alpine:3.20\n", encoding="utf-8")
+    config = OperatorComposeConfig(directory=str(project), file="compose.yaml")
+    with pytest.raises(OperatorFileError, match="outside managed project"):
+        materialize_operator_files(
+            config, tmp_path / "snapshot", forbidden_roots=[tmp_path / "projects"], require_read_only=False
+        )
+    with pytest.raises(OperatorFileError, match="administrator-owned"):
+        materialize_operator_files(config, tmp_path / "snapshot", forbidden_roots=[])
+
+    with pytest.raises(ValidationError, match="file must be a file name"):
+        OperatorComposeConfig(directory=str(tmp_path), file="subdir/compose.yaml")
+
+
+def test_operator_compose_rejects_escaping_env_file(tmp_path: Path) -> None:
+    operator_dir = tmp_path / "operator"
+    operator_dir.mkdir()
+    (operator_dir / "compose.yaml").write_text(
+        "services:\n  app:\n    image: alpine:3.20\n    env_file: ../outside.env\n", encoding="utf-8"
+    )
+    config = OperatorComposeConfig(directory=str(operator_dir), file="compose.yaml")
+    with pytest.raises(OperatorFileError, match="static relative path"):
+        materialize_operator_files(config, tmp_path / "snapshot", forbidden_roots=[], require_read_only=False)
 
 
 def test_ref_and_subdir_validation_are_shape_checks() -> None:

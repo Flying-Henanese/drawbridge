@@ -127,6 +127,18 @@ apps:
         runtime_profile: approved-legacy-app
 ```
 
+管理员直接维护 Compose 时，可在目标应用环境中设置 `operator_compose.directory` 与
+`operator_compose.file`（示例见 [README](../README.md#管理员维护的-compose-与环境文件)）。
+该模式不使用 `approved_compose_digests` 批准文件内容，且即使 Compose 同时有 `build:`，
+也只使用已有 `image:`。目录及其所有父目录、Compose 和被引用的环境文件必须不是符号链接，
+不能由 Gateway/Runner 用户持有或由组及其他用户写入。目录应放在 Git 项目根目录、
+Drawbridge 状态目录和发布目录之外，例如 `/etc/drawbridge/apps/<app>`；Gateway 和 Runner
+需要读取权限。设置目录路径或入口文件名时要更新两份服务配置、重启并重新登记应用；仅修改
+文件内容无需这些步骤。新的 plan 会从当前管理员文件取快照，Runner 执行前重新读取并比较，
+不一致时要求重新 plan。`.env` 用于 Compose 插值，服务级 `env_file` 仅接受目录内的静态相对
+路径。Runner 解析本地镜像并以镜像 ID 启动；真实 Docker 路径仍须在服务器单独验收。
+服务器逐步验收步骤见 [管理员维护 Compose 模式测试计划](OPERATOR_COMPOSE_SERVER_TEST_PLAN.md)。
+
 Ascend profile 应为每个实际 NPU 服务登记 driver、`npu-smi`、DCMI 和模型缓存挂载，并加入：
 
 ```yaml

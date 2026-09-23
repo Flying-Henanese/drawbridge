@@ -54,7 +54,7 @@ API；多语句状态转换在锁内使用短 `BEGIN IMMEDIATE` 事务。Gateway
 | [`storage.py`](../../src/drawbridge/storage.py) | SQLite WAL 中的应用绑定、计划、任务队列、workspace revision、release 和事件。 |
 | [`runner.py`](../../src/drawbridge/runner.py) | 从共享数据库认领任务并调用 `service.run_one_job()`。 |
 | [`gitops.py`](../../src/drawbridge/gitops.py) | 校验固定 origin/ref，按 SHA 导出源码快照。 |
-| [`compose.py`](../../src/drawbridge/compose.py)、[`build.py`](../../src/drawbridge/build.py) | 校验 Compose 和登记的构建目标；构建、导入并识别镜像。 |
+| [`compose.py`](../../src/drawbridge/compose.py)、[`operator_files.py`](../../src/drawbridge/operator_files.py)、[`build.py`](../../src/drawbridge/build.py) | 校验 Compose、复制管理员维护的文件和校验构建目标；构建、导入并识别镜像。 |
 | [`process.py`](../../src/drawbridge/process.py)、[`httpverify.py`](../../src/drawbridge/httpverify.py) | 受限进程执行与出站 HTTP 验证。 |
 | [`selfcheck.py`](../../src/drawbridge/selfcheck.py) | 检查 Python、工具、状态目录、SQLite 和 BuildKit 配置条件。 |
 
@@ -63,11 +63,12 @@ API；多语句状态转换在锁内使用短 `BEGIN IMMEDIATE` 事务。Gateway
 面向 MCP 调用者的参数顺序和失败处理见[系统发布路径](RELEASE_FLOW.md)。
 
 1. **注册**：`ops_app_register` 接受管理员 `allowed_project_roots` 内已存在的绝对目录、
-   项目内的 Compose 文件和已登记的构建 profile。服务端拒绝符号链接路径、无效 Git
+   项目内的 Compose 文件或管理员配置指定的服务器 Compose 入口，以及已登记的构建 profile。服务端拒绝符号链接路径、无效 Git
    origin、不支持的 Compose 特权键和未登记的构建选项。注册成功才会保存应用绑定。
 2. **计划**：`ops_release_plan` 在绑定的仓库中以 `fetch` 或 `local` 模式解析完整 Git ref
    或允许的 SHA，从该 SHA 的 archive 创建临时快照，应用显式选择的 workspace revision，
-   再校验 Compose、build 声明和固定服务集合。计划冻结规范化 Compose/build/revision 指纹、
+   再校验 Compose、build 声明和固定服务集合。管理员模式会覆盖快照中的 Compose 与被引用
+   环境文件，并记录其内容摘要。计划冻结规范化 Compose/build/revision 指纹、
    binding 配置白名单摘要、完整 build profile 摘要和当前发布基线。计划有 15 分钟有效期；
    临时快照在返回前清理，这里不构建或部署。
 3. **排队**：`ops_release_apply(plan_id, idempotency_key)` 检查计划及基线，将部署任务写入
@@ -76,13 +77,14 @@ API；多语句状态转换在锁内使用短 `BEGIN IMMEDIATE` 事务。Gateway
    `ops_release_status(job_id)` 才能知道任务结果。
 4. **执行**：Runner 从队列认领任务，先复验 plan schema、binding 配置、build profile 和
    当前基线，再按冻结 SHA 用 `git archive` 创建发布快照并应用显式 revision。Runner 使用
-   与计划阶段相同的原语重新计算全部快照指纹；任一字段不一致都在构建、Compose 或 simulation
+   与计划阶段相同的原语重新计算全部快照指纹；管理员文件也要重新读取并比较。任一字段不一致都在构建、Compose 或 simulation
    release 写入前以 `STALE_PLAN` 终止。
 5. **构建与部署**：simulation 只写发布证据。Docker 模式对 `build:` 服务调用固定的
    BuildKit profile，导出 Docker archive，导入 Docker Engine，查验镜像 ID，生成引用
    镜像 ID 的运行时 Compose，然后执行带 `--detach`、`--no-build`、`--pull never` 和
    `--wait` 参数的 `docker compose up`，再执行配置的健康检查。仅使用现成 `image:` 的
-   服务跳过构建。
+   服务跳过构建。管理员模式统一使用本地预建镜像；Runner 解析镜像 ID 并将其写入运行时
+   Compose，不要求 Gateway 访问 Docker daemon。
 6. **记录**：任务状态、release、事件和构建制品信息存入 SQLite 或发布目录；通过
    `ops_status`、`ops_logs`、`ops_http_request` 获取后续运行证据。
 

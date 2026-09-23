@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import os
@@ -25,7 +26,7 @@ from .compose import (
     parse_compose,
     write_trusted_compose,
 )
-from .config import AppConfig, BuildProfile, EnvironmentConfig, Settings
+from .config import AppConfig, BuildProfile, EnvironmentConfig, OperatorComposeConfig, Settings
 from .errors import DrawbridgeError, error_response, ok
 from .gitops import GitError, GitRepository
 from .models import (
@@ -35,6 +36,7 @@ from .models import (
     validate_project_path,
     validate_subdir,
 )
+from .operator_files import OperatorFileError, materialize_operator_files
 from .process import ExecutionSpec, SafeExecutor
 from .storage import (
     Database,
@@ -45,12 +47,13 @@ from .storage import (
     create_request_hash,
 )
 
-_PLAN_SCHEMA_VERSION = 1
+_PLAN_SCHEMA_VERSION = 2
 _PLAN_SNAPSHOT_FIELDS = (
     "workspace_revision_digest",
     "service_set",
     "compose_digest",
     "build_declaration_digest",
+    "operator_files_digest",
 )
 
 
@@ -140,12 +143,40 @@ class DrawbridgeService:
             configured_env = configured_app.environments.get(environment) if configured_app else None
             allowed_data_mounts = [item.model_dump() for item in configured_env.data_mounts] if configured_env else []
             runtime_profile = self._runtime_profile_payload(configured_env)
-            compose = parse_compose(
-                project / relative_compose,
-                project,
-                allowed_data_mounts=allowed_data_mounts,
-                runtime_profile=runtime_profile,
-            )
+            operator_config = configured_env.operator_compose if configured_env else None
+            if operator_config is not None:
+                if relative_compose != operator_config.file:
+                    raise DrawbridgeError("INVALID_PARAMETER", "compose_file must match the administrator entry file")
+                registration_root = self.settings.resolved_state_dir(self.base_dir) / "operator-registration"
+                registration_root.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(
+                    prefix="drawbridge-operator-register-", dir=registration_root
+                ) as temporary:
+                    operator_root = Path(temporary)
+                    _, _, operator_paths = materialize_operator_files(
+                        operator_config,
+                        operator_root,
+                        forbidden_roots=self._operator_forbidden_roots(project),
+                        require_read_only=configured_env is not None and configured_env.deployment_mode == "docker",
+                    )
+                    self._reject_operator_editable_overlap(
+                        operator_paths,
+                        [item.model_dump() for item in configured_env.editable_files] if configured_env else [],
+                    )
+                    compose = parse_compose(
+                        operator_root / relative_compose,
+                        operator_root,
+                        allowed_data_mounts=allowed_data_mounts,
+                        runtime_profile=runtime_profile,
+                        operator_trusted=True,
+                    )
+            else:
+                compose = parse_compose(
+                    project / relative_compose,
+                    project,
+                    allowed_data_mounts=allowed_data_mounts,
+                    runtime_profile=runtime_profile,
+                )
             origin = GitRepository.detect_origin(project)
             git = GitRepository(project, origin, self._default_ref_patterns())
             git.verify_repository()
@@ -188,7 +219,11 @@ class DrawbridgeService:
                 binding["current_revision"] = revision_id
             if existing is not None:
                 if self._binding_identity(existing) != self._binding_identity(binding):
-                    raise DrawbridgeError("APP_ALREADY_REGISTERED", "app/environment is already registered")
+                    operator_transition = existing.get("operator_compose") or binding.get("operator_compose")
+                    if not operator_transition or self._operator_binding_identity(
+                        existing
+                    ) != self._operator_binding_identity(binding):
+                        raise DrawbridgeError("APP_ALREADY_REGISTERED", "app/environment is already registered")
                 if self._runtime_policy_identity(existing) == self._runtime_policy_identity(binding):
                     return ok(self._binding_summary(existing), request_id=request_id)
                 version = await self.database.save_binding(app, environment, binding, status=binding["status"])
@@ -206,7 +241,7 @@ class DrawbridgeService:
                 "app_registered", self._public_summary(binding), app=app, environment=environment
             )
             return ok(self._binding_summary(binding), request_id=request_id)
-        except (ValueError, ComposeError, GitError) as exc:
+        except (ValueError, ComposeError, GitError, OperatorFileError) as exc:
             return error_response(DrawbridgeError("INVALID_PARAMETER", str(exc)), request_id=request_id)
         except DrawbridgeError as exc:
             return error_response(exc, request_id=request_id)
@@ -405,7 +440,9 @@ class DrawbridgeService:
                     profile=profile,
                     current=current,
                 )
-                fingerprint = self._snapshot_fingerprint(snapshot["compose"], snapshot["revision"], profile)
+                fingerprint = self._snapshot_fingerprint(
+                    snapshot["compose"], snapshot["revision"], profile, snapshot["operator_files_digest"]
+                )
             finally:
                 shutil.rmtree(temporary_root, ignore_errors=True)
             plan_id = str(uuid.uuid4())
@@ -950,8 +987,11 @@ class DrawbridgeService:
                 profile=profile,
                 current=current,
             )
-            fingerprint = self._snapshot_fingerprint(snapshot["compose"], snapshot["revision"], profile)
+            fingerprint = self._snapshot_fingerprint(
+                snapshot["compose"], snapshot["revision"], profile, snapshot["operator_files_digest"]
+            )
             self._compare_snapshot_fingerprint(plan, fingerprint)
+            prebuilt_image_ids = await self._operator_image_ids(snapshot, binding)
             if binding["deployment_mode"] == "simulation":
                 if not self.settings.allow_simulation:
                     raise DrawbridgeError("APP_NOT_DEPLOYABLE", "simulation mode is disabled")
@@ -967,7 +1007,15 @@ class DrawbridgeService:
                     "health": {"status": "passed", "validation_level": "simulation"},
                 }
             else:
-                release_payload = await self._deploy_docker(plan, binding, release_id, release_dir, snapshot["compose"])
+                release_payload = await self._deploy_docker(
+                    plan,
+                    binding,
+                    release_id,
+                    release_dir,
+                    snapshot["compose"],
+                    snapshot["interpolation_env"],
+                    prebuilt_image_ids,
+                )
         except Exception as exc:
             runtime_marker = release_dir / f".drawbridge-runtime-started-{release_id}"
             if release_dir.exists() and not runtime_marker.exists():
@@ -1055,6 +1103,22 @@ class DrawbridgeService:
                 os.replace(temporary, target)
                 if self._sha256(target.read_bytes()) != post_digest:
                     raise DrawbridgeError("PATCH_BASE_MISMATCH", "revision overlay digest mismatch")
+        operator_files_digest = None
+        interpolation_env = None
+        if binding.get("operator_compose") is not None:
+            operator_config = OperatorComposeConfig.model_validate(binding["operator_compose"])
+            try:
+                operator_files_digest, has_dotenv, operator_paths = materialize_operator_files(
+                    operator_config,
+                    destination,
+                    forbidden_roots=self._operator_forbidden_roots(Path(binding["source_workspace"])),
+                    require_read_only=binding["deployment_mode"] == "docker",
+                )
+                self._reject_operator_editable_overlap(operator_paths, binding.get("editable_files", []))
+            except OperatorFileError as exc:
+                raise DrawbridgeError("INVALID_PARAMETER", str(exc)) from exc
+            if has_dotenv:
+                interpolation_env = destination / ".env"
         release_root = destination.resolve()
         compose_path = (destination / binding["compose_file"]).resolve()
         try:
@@ -1069,6 +1133,7 @@ class DrawbridgeService:
                 destination,
                 allowed_data_mounts=binding.get("data_mounts", []),
                 runtime_profile=binding.get("runtime_profile"),
+                operator_trusted=binding.get("operator_compose") is not None,
             )
         except ComposeError as exc:
             raise DrawbridgeError("INVALID_PARAMETER", f"compose validation failed: {exc}") from exc
@@ -1078,12 +1143,98 @@ class DrawbridgeService:
             current=current,
         )
         validate_build_declarations(compose, profile)
-        return {"compose": compose, "compose_file": compose_path, "revision": revision}
+        return {
+            "compose": compose,
+            "compose_file": compose_path,
+            "revision": revision,
+            "operator_files_digest": operator_files_digest,
+            "interpolation_env": interpolation_env,
+        }
+
+    async def _operator_image_ids(self, snapshot: dict[str, Any], binding: dict[str, Any]) -> dict[str, str]:
+        if binding.get("operator_compose") is None or binding["deployment_mode"] != "docker":
+            return {}
+        docker = shutil.which("docker")
+        if docker is None:
+            raise DrawbridgeError("RUNTIME_UNAVAILABLE", "docker executable is not available")
+        source_dir = snapshot["compose_file"].parent
+        empty_env = self.settings.resolved_state_dir(self.base_dir) / "empty.env"
+        empty_env.parent.mkdir(parents=True, exist_ok=True)
+        empty_env.touch(exist_ok=True)
+        resolved = await self.executor.execute(
+            ExecutionSpec(
+                program=str(Path(docker).resolve()),
+                argv=[
+                    "compose",
+                    "--ansi",
+                    "never",
+                    "--project-name",
+                    binding["project_name"],
+                    "--project-directory",
+                    str(source_dir),
+                    "--env-file",
+                    str(snapshot["interpolation_env"] or empty_env),
+                    "-f",
+                    str(snapshot["compose_file"]),
+                    "config",
+                    "--format",
+                    "json",
+                ],
+                cwd=source_dir,
+                timeout_seconds=30,
+                output_limit_bytes=2 * 1024 * 1024,
+                label="operator-compose-resolve-images",
+            )
+        )
+        if resolved.exit_code != 0 or resolved.truncated:
+            raise DrawbridgeError("INVALID_PARAMETER", "operator Compose image resolution failed")
+        try:
+            services = json.loads(resolved.stdout)["services"]
+            images = {name: services[name]["image"] for name in snapshot["compose"].services}
+        except (ValueError, KeyError, TypeError) as exc:
+            raise DrawbridgeError("INVALID_PARAMETER", "operator Compose resolved service images are invalid") from exc
+        image_ids: dict[str, str] = {}
+        for name, reference in images.items():
+            if not isinstance(reference, str) or not reference:
+                raise DrawbridgeError("INVALID_PARAMETER", "operator Compose service image is invalid")
+            inspected = await self.executor.execute(
+                ExecutionSpec(
+                    program=str(Path(docker).resolve()),
+                    argv=["image", "inspect", "--format", "{{.Id}}", reference],
+                    cwd=source_dir,
+                    timeout_seconds=15,
+                    output_limit_bytes=4096,
+                    label="operator-image-inspect",
+                )
+            )
+            image_id = inspected.stdout.strip()
+            if inspected.exit_code != 0 or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+                raise DrawbridgeError("RUNTIME_UNAVAILABLE", "operator Compose image is unavailable locally")
+            image_ids[name] = image_id
+        return image_ids
 
     async def _deploy_docker(
-        self, plan: dict[str, Any], binding: dict[str, Any], release_id: str, release_dir: Path, compose: ComposeSpec
+        self,
+        plan: dict[str, Any],
+        binding: dict[str, Any],
+        release_id: str,
+        release_dir: Path,
+        compose: ComposeSpec,
+        interpolation_env: Path | None,
+        prebuilt_image_ids: dict[str, str],
     ) -> dict[str, Any]:
         built_images: dict[str, dict[str, Any]] = {}
+        if binding.get("operator_compose") is not None:
+            runtime_raw = copy.deepcopy(compose.raw)
+            for service_name, image_id in prebuilt_image_ids.items():
+                runtime_raw["services"][service_name]["image"] = image_id
+            compose = ComposeSpec(
+                path=compose.path,
+                raw=runtime_raw,
+                services=compose.services,
+                image_services=prebuilt_image_ids,
+                build_services=compose.build_services,
+            )
         if compose.build_services:
             profile = self.settings.build_profiles.get(binding["profile"])
             if profile is None or plan.get("build_profile_digest") != self._digest(profile.model_dump()):
@@ -1114,7 +1265,7 @@ class DrawbridgeService:
                         "--project-directory",
                         str(release_dir),
                         "--env-file",
-                        str(empty_env),
+                        str(interpolation_env or empty_env),
                         "-f",
                         str(compose_path),
                         "up",
@@ -1337,6 +1488,7 @@ class DrawbridgeService:
             "data_mounts": [item.model_dump() for item in env.data_mounts],
             "runtime_profile_name": env.runtime_profile,
             "runtime_profile": self._runtime_profile_payload(env),
+            "operator_compose": env.operator_compose.model_dump() if env.operator_compose else None,
         }
 
     def _new_binding(
@@ -1362,6 +1514,7 @@ class DrawbridgeService:
         health_checks = [item.model_dump() for item in configured_env.health_checks] if configured_env else []
         data_mounts = [item.model_dump() for item in configured_env.data_mounts] if configured_env else []
         runtime_profile = self._runtime_profile_payload(configured_env)
+        operator_compose = configured_env.operator_compose if configured_env else None
         return {
             "app": app,
             "environment": environment,
@@ -1369,7 +1522,9 @@ class DrawbridgeService:
             "status": "deployable",
             "source_workspace": str(project),
             "compose_file": relative_compose,
-            "compose_file_abs": str(compose.path),
+            "compose_file_abs": str(Path(operator_compose.directory) / operator_compose.file)
+            if operator_compose
+            else str(compose.path),
             "origin": origin,
             "allowed_ref_patterns": configured_app.git.allowed_ref_patterns
             if configured_app
@@ -1386,6 +1541,7 @@ class DrawbridgeService:
             "data_mounts": data_mounts,
             "runtime_profile_name": configured_env.runtime_profile if configured_env else None,
             "runtime_profile": runtime_profile,
+            "operator_compose": operator_compose.model_dump() if operator_compose else None,
             "deployment_mode": configured_env.deployment_mode
             if configured_env
             else ("simulation" if self.settings.allow_simulation else "docker"),
@@ -1397,11 +1553,26 @@ class DrawbridgeService:
     def _git_for_binding(self, binding: dict[str, Any]) -> GitRepository:
         return GitRepository(Path(binding["source_workspace"]), binding["origin"], binding["allowed_ref_patterns"])
 
+    def _operator_forbidden_roots(self, project: Path) -> list[Path]:
+        return [
+            project,
+            *self.settings.resolved_allowed_roots(self.base_dir),
+            self.settings.resolved_state_dir(self.base_dir),
+            self.settings.resolved_release_root(self.base_dir),
+        ]
+
+    @staticmethod
+    def _reject_operator_editable_overlap(operator_paths: frozenset[str], editable_files: list[dict[str, Any]]) -> None:
+        for editable in editable_files:
+            if Path(validate_subdir(editable["path"])).as_posix() in operator_paths:
+                raise DrawbridgeError("FORBIDDEN_OPERATION", "operator files cannot be MCP editable files")
+
     def _snapshot_fingerprint(
         self,
         compose: ComposeSpec,
         revision: dict[str, Any] | None,
         profile: BuildProfile,
+        operator_files_digest: str | None,
     ) -> dict[str, Any]:
         build_declarations: dict[str, Any] = {}
         for service in sorted(compose.build_services):
@@ -1420,6 +1591,7 @@ class DrawbridgeService:
             "service_set": sorted(compose.services),
             "compose_digest": self._digest(compose.raw),
             "build_declaration_digest": self._digest(build_declarations),
+            "operator_files_digest": operator_files_digest,
         }
 
     def _workspace_revision_digest(self, revision: dict[str, Any] | None) -> str | None:
@@ -1468,6 +1640,7 @@ class DrawbridgeService:
             "release_root",
             "data_root",
             "profile",
+            "operator_compose",
         )
         return self._digest({field: binding.get(field) for field in fields})
 
@@ -1501,6 +1674,7 @@ class DrawbridgeService:
             "service_set",
             "compose_digest",
             "build_declaration_digest",
+            "operator_files_digest",
             "binding_version",
             "configuration_digest",
             "build_profile_digest",
@@ -1535,6 +1709,9 @@ class DrawbridgeService:
         for field in ("compose_digest", "build_declaration_digest", "configuration_digest", "build_profile_digest"):
             if not DrawbridgeService._is_sha256(plan[field]):
                 raise DrawbridgeError("STALE_PLAN", f"plan {field} is invalid", retryable=True)
+        operator_files_digest = plan["operator_files_digest"]
+        if operator_files_digest is not None and not DrawbridgeService._is_sha256(operator_files_digest):
+            raise DrawbridgeError("STALE_PLAN", "plan operator_files_digest is invalid", retryable=True)
         if type(plan["binding_version"]) is not int or plan["binding_version"] < 1:
             raise DrawbridgeError("STALE_PLAN", "plan binding_version is invalid", retryable=True)
 
@@ -1559,10 +1736,19 @@ class DrawbridgeService:
             tuple(binding.get("services", [])),
         )
 
+    def _operator_binding_identity(self, binding: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            binding.get("source_workspace"),
+            binding.get("origin"),
+            tuple(binding.get("services", [])),
+        )
+
     def _runtime_policy_identity(self, binding: dict[str, Any]) -> tuple[Any, ...]:
         return (
+            binding.get("compose_file"),
             binding.get("runtime_profile_name"),
             self._digest(binding.get("runtime_profile")),
+            self._digest(binding.get("operator_compose")),
         )
 
     def _runtime_profile_payload(self, environment: EnvironmentConfig | None) -> dict[str, Any] | None:

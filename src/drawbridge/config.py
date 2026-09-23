@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -136,6 +137,23 @@ class TestSuiteConfig(ConfigModel):
     network: StrictStr | None = None
 
 
+class OperatorComposeConfig(ConfigModel):
+    directory: StrictStr
+    file: StrictStr = "compose.yaml"
+
+    @model_validator(mode="after")
+    def validate_paths(self) -> OperatorComposeConfig:
+        if not Path(self.directory).is_absolute():
+            raise ValueError("operator_compose.directory must be absolute")
+        if (
+            self.file in {"", ".", ".."}
+            or Path(self.file).name != self.file
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", self.file)
+        ):
+            raise ValueError("operator_compose.file must be a file name")
+        return self
+
+
 class EnvironmentConfig(ConfigModel):
     runtime: Literal["compose"] = "compose"
     project_name: StrictStr
@@ -153,6 +171,7 @@ class EnvironmentConfig(ConfigModel):
     deployment_mode: Literal["docker", "simulation"] = "docker"
     prebuilt_image: StrictStr | None = None
     runtime_profile: StrictStr | None = None
+    operator_compose: OperatorComposeConfig | None = None
 
 
 class AppConfig(ConfigModel):

@@ -8,7 +8,8 @@
 
 - 先调用 `ops_catalog` 获取服务器当前工具和限制。目标环境目前只能是 `staging`。
 - 项目须有本地 `.git` 目录、唯一 `origin`、至少一个 commit，以及可通过校验的
-  Compose 文件。传给注册操作的 `project_dir` 必须是管理员允许的真实绝对路径，不能
+  Compose 文件。Compose 可来自 Git 快照，也可来自管理员配置指定的服务器目录。传给注册
+  操作的 `project_dir` 必须是管理员允许的真实绝对路径，不能
   含符号链接。构建服务还须匹配已登记的 BuildKit profile。
 - `ops_app_register` 失败时不会形成可操作的应用绑定。修正源项目、Compose 或管理员
   配置后再注册；`ops_workspace_patch` 只能作用于已登记的可编辑文件。
@@ -16,12 +17,14 @@
 ## 按顺序调用
 
 1. **注册**：尚未绑定时调用 `ops_app_register(app, project_dir, compose_file,
-   idempotency_key, profile)`。服务端检查路径、Git、Compose 和构建声明，并记录绑定。
+   idempotency_key, profile)`。管理员模式的 `compose_file` 须与管理员配置的入口文件名一致。
+   服务端检查路径、Git、Compose 和构建声明，并记录绑定。
 2. **计划**：调用 `ops_release_plan(app, git_ref, source_mode)`。`git_ref` 使用完整
    `refs/heads/...`、`refs/tags/...` 或允许的 40 位 SHA；`fetch` 仅接受分支或标签，
    `local` 可使用本地已有提交。若要发布登记过的配置 revision，同时传
-   `workspace_revision`。服务端会立即从解析后的 SHA 创建临时 archive，应用该 revision，
-   校验 Compose、build 声明和固定服务集合，再保存版本化计划。保存返回的 `plan_id`、
+   `workspace_revision`。服务端会立即从解析后的 SHA 创建临时 archive，应用该 revision；
+   管理员模式再复制 Compose、`.env` 和服务级 `env_file`。校验 Compose、build 声明和
+   固定服务集合后保存版本化计划。保存返回的 `plan_id`、
    `commit_sha`、`services`、`compose_digest` 和 `build_declaration_digest`；计划 15 分钟后过期。
 3. **排队**：调用 `ops_release_apply(plan_id, idempotency_key)`，保存 `job_id`。重试同一
    请求时复用幂等键。`status: ok` 表示任务已入队或复用已有任务，不表示部署成功。
@@ -31,23 +34,26 @@
 
 ## Runner 实际执行的步骤
 
-Runner 从共享 SQLite 队列认领部署 job，从计划中的 SHA 创建发布快照，并重新校验
-Compose。随后逐项比较服务集合、Compose、build 声明、workspace revision、binding 配置和
+Runner 从共享 SQLite 队列认领部署 job，从计划中的 SHA 创建发布快照；管理员模式重新复制
+受控文件，之后校验 Compose。随后逐项比较服务集合、Compose、管理员文件、build 声明、workspace revision、binding 配置和
 完整 build profile 摘要。旧格式计划或任一指纹不一致时返回可重试的 `STALE_PLAN`，且不会
 调用 BuildKit、Docker 或写入成功 release。simulation 模式只写发布记录。Docker 模式对
 登记的 `build:` 服务依次调用 BuildKit、导出 archive、`docker image load`、查验 image ID，
 然后以引用 image ID 的运行时 Compose 执行
 `docker compose up --no-build --pull never --wait`。已有 `image:` 服务不经 BuildKit。
+管理员模式一律使用预建镜像，由 Runner 解析本地镜像 ID 并写入运行时 Compose。
 最后保存 release 和健康检查结果。构建流程没有单独的 MCP 工具。
 
 ## 计划不变量
 
 - `commit_sha` 在计划创建后不再跟随分支或标签移动；Runner 只能导出计划保存的 SHA。
+- 管理员模式只从管理员配置指定的目录读取部署配置。MCP 不能选择路径或修改文件；内容改动
+  无需维护批准 SHA，但会使尚未执行的旧 plan 失效。
 - workspace revision 必须显式保存和重放；没有 revision 时也必须明确使用原始快照，不能用
   当前工作区内容或隐式的 `current_revision`。
 - 服务集合在注册、计划和执行之间保持一致。Compose 新增、删除或改名服务都要求重新注册
   或重新创建计划，不能让 Runner 临时扩展发布范围。
-- 计划中的 Compose、build 声明、revision、binding 配置、完整 build profile 和基线摘要
+- 计划中的 Compose、管理员文件、build 声明、revision、binding 配置、完整 build profile 和基线摘要
   必须全部匹配。旧 schema 或任一字段不匹配均以 `STALE_PLAN` 失败；调用者应重新计划。
 
 ## 失败与后续操作

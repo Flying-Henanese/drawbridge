@@ -177,6 +177,233 @@ async def test_release_plan_rejects_service_topology_change_before_saving_plan(t
 
 
 @pytest.mark.asyncio
+async def test_operator_compose_and_env_changes_need_only_a_new_plan(tmp_path: Path) -> None:
+    project, sha = make_project(tmp_path / "projects")
+    operator_dir = tmp_path / "operator" / "demo"
+    operator_dir.mkdir(parents=True)
+    (operator_dir / "compose.yaml").write_text(
+        "services:\n  app:\n    image: ${APP_IMAGE}\n    env_file: .env\n    command: [sleep, '30']\n",
+        encoding="utf-8",
+    )
+    (operator_dir / ".env").write_text("APP_IMAGE=alpine:3.20\nAPP_MODE=first\n", encoding="utf-8")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        concurrency={"min_deploy_interval_seconds": 0},
+        allow_simulation=True,
+        apps={
+            "demo": {
+                "git": {"repo_path": str(project), "origin": "https://example.invalid/drawbridge.git"},
+                "environments": {
+                    "staging": {
+                        "project_name": "demo",
+                        "deployment_mode": "simulation",
+                        "operator_compose": {"directory": str(operator_dir), "file": "compose.yaml"},
+                    }
+                },
+            }
+        },
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    try:
+        service = DrawbridgeService(settings, database, base_dir=tmp_path)
+        registered = await service.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="compose.yaml",
+            idempotency_key="register-operator-001",
+        )
+        assert registered["status"] == "ok", registered
+        first = await service.release_plan(
+            app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+        )
+        assert first["status"] == "ok"
+        stored_plan = await database.get_plan(first["data"]["plan_id"])
+        assert stored_plan is not None
+        assert "APP_MODE=first" not in json.dumps(stored_plan)
+        (operator_dir / ".env").write_text("APP_IMAGE=alpine:3.20\nAPP_MODE=second\n", encoding="utf-8")
+        queued = await service.release_apply(plan_id=first["data"]["plan_id"], idempotency_key="apply-operator-001")
+        await service.run_one_job()
+        stale = await service.release_status(queued["data"]["job_id"])
+        assert stale["data"]["error_code"] == "STALE_PLAN"
+        assert await database.get_current_release("demo", "staging") is None
+
+        (operator_dir / "compose.yaml").write_text(
+            "services:\n  app:\n    image: ${APP_IMAGE}\n    env_file: .env\n    command: [sleep, '60']\n",
+            encoding="utf-8",
+        )
+        planned = await service.release_plan(
+            app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+        )
+        assert planned["status"] == "ok"
+        applied = await service.release_apply(plan_id=planned["data"]["plan_id"], idempotency_key="apply-operator-002")
+        await service.run_one_job()
+        status = await service.release_status(applied["data"]["job_id"])
+        assert status["data"]["status"] == "succeeded"
+        release = await database.get_current_release("demo", "staging")
+        assert release is not None
+        assert release["source_sha"] == sha
+        assert Path(release["release_dir"], ".env").read_text(encoding="utf-8").endswith("APP_MODE=second\n")
+        assert "'60'" in Path(release["compose_file"]).read_text(encoding="utf-8")
+
+        (operator_dir / "docker-compose.yaml").write_text(
+            (operator_dir / "compose.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        settings.apps["demo"].environments["staging"].operator_compose.file = "docker-compose.yaml"
+        refreshed = await service.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="docker-compose.yaml",
+            idempotency_key="register-operator-002",
+        )
+        assert refreshed["status"] == "ok", refreshed
+        assert refreshed["data"]["version"] > registered["data"]["version"]
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_operator_docker_release_pins_resolved_local_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    operator_dir = tmp_path / "operator" / "demo"
+    operator_dir.mkdir(parents=True)
+    (operator_dir / "compose.yaml").write_text(
+        "services:\n  app:\n    image: ${APP_IMAGE}\n    env_file: .env\n    build: .\n",
+        encoding="utf-8",
+    )
+    (operator_dir / ".env").write_text("APP_IMAGE=alpine:3.20\n", encoding="utf-8")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        managed_release_root=str(tmp_path / "releases"),
+        auth={"mode": "token", "token": "local-test-token"},
+        apps={
+            "demo": {
+                "git": {"repo_path": str(project), "origin": "https://example.invalid/drawbridge.git"},
+                "environments": {
+                    "staging": {
+                        "project_name": "demo",
+                        "operator_compose": {"directory": str(operator_dir), "file": "compose.yaml"},
+                    }
+                },
+            }
+        },
+        build_profiles={"default": {"mode": "prebuilt"}},
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    try:
+        service = DrawbridgeService(settings, database, base_dir=tmp_path)
+        from drawbridge.operator_files import materialize_operator_files
+
+        def materialize_for_test(
+            config: object, destination: Path, **kwargs: object
+        ) -> tuple[str, bool, frozenset[str]]:
+            kwargs["require_read_only"] = False
+            return materialize_operator_files(config, destination, **kwargs)
+
+        monkeypatch.setattr("drawbridge.service.materialize_operator_files", materialize_for_test)
+        monkeypatch.setattr("drawbridge.service.shutil.which", lambda name: f"/usr/bin/{name}")
+        seen: list[ExecutionSpec] = []
+        image_version = ["a"]
+
+        async def execute(spec: ExecutionSpec) -> ExecutionResult:
+            seen.append(spec)
+            if spec.label == "operator-compose-resolve-images":
+                output = '{"services":{"app":{"image":"alpine:3.20"}}}'
+            elif spec.label == "operator-image-inspect":
+                output = "sha256:" + image_version[0] * 64 + "\n"
+            else:
+                output = ""
+            return ExecutionResult(0, TerminationReason.EXITED, 1, output, "", len(output), 0, len(output), False)
+
+        monkeypatch.setattr(service.executor, "execute", execute)
+        registered = await service.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="compose.yaml",
+            idempotency_key="register-operator-docker-001",
+        )
+        assert registered["status"] == "ok", registered
+        planned = await service.release_plan(
+            app="demo", environment="staging", source_mode="local", git_ref="refs/heads/main"
+        )
+        assert planned["status"] == "ok", planned
+        assert seen == []
+        image_version[0] = "b"
+        applied = await service.release_apply(
+            plan_id=planned["data"]["plan_id"], idempotency_key="apply-operator-docker-001"
+        )
+        await service.run_one_job()
+        status = await service.release_status(applied["data"]["job_id"])
+        assert status["data"]["status"] == "succeeded", status
+        assert [spec.label for spec in seen].count("operator-image-inspect") == 1
+        assert all("--no-build" in spec.argv for spec in seen if spec.label == "compose-deploy")
+        current = await database.get_current_release("demo", "staging")
+        assert current is not None
+        runtime_compose = yaml.safe_load(Path(current["compose_file"]).read_text(encoding="utf-8"))
+        assert runtime_compose["services"]["app"]["image"] == "sha256:" + "b" * 64
+        assert any(
+            str(Path(current["release_dir"]) / ".env") in spec.argv for spec in seen if spec.label == "compose-deploy"
+        )
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_operator_env_cannot_overlap_mcp_editable_file(tmp_path: Path) -> None:
+    project, _ = make_project(tmp_path / "projects")
+    operator_dir = tmp_path / "operator"
+    operator_dir.mkdir()
+    (operator_dir / "compose.yaml").write_text(
+        "services:\n  app:\n    image: alpine:3.20\n    env_file: runtime.env\n", encoding="utf-8"
+    )
+    (operator_dir / "runtime.env").write_text("PASSWORD=private\n", encoding="utf-8")
+    settings = Settings(
+        state_dir=str(tmp_path / "state"),
+        allowed_project_roots=[str(tmp_path / "projects")],
+        auth={"mode": "token", "token": "local-test-token"},
+        allow_simulation=True,
+        apps={
+            "demo": {
+                "git": {"repo_path": str(project), "origin": "https://example.invalid/drawbridge.git"},
+                "environments": {
+                    "staging": {
+                        "project_name": "demo",
+                        "deployment_mode": "simulation",
+                        "operator_compose": {"directory": str(operator_dir)},
+                        "editable_files": [{"alias": "secrets", "path": "runtime.env", "display": "text"}],
+                    }
+                },
+            }
+        },
+    )
+    database = Database(tmp_path / "state" / "state.db")
+    await database.initialize()
+    try:
+        service = DrawbridgeService(settings, database, base_dir=tmp_path)
+        registered = await service.app_register(
+            app="demo",
+            environment="staging",
+            project_dir=str(project),
+            compose_file="compose.yaml",
+            idempotency_key="register-operator-overlap-001",
+        )
+        assert registered["error"]["code"] == "FORBIDDEN_OPERATION", registered
+        assert await database.get_binding("demo", "staging") is None
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_release_apply_rejects_old_plan_schema_without_queueing(tmp_path: Path) -> None:
     project, _ = make_project(tmp_path / "projects")
     settings = Settings(

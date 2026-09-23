@@ -341,6 +341,41 @@ Compose 文件摘要批准。此设置会信任该文件的完整内容，应先
 两者不是同一个值。t4 上已用 ContractLens 验证这一流程，结果见
 [docs/VERIFICATION_RECORD.md 的 01C 真实发布记录](docs/VERIFICATION_RECORD.md#20-01c-可信-compose-与预建镜像发布验证2026-09-22)。
 
+### 管理员维护的 Compose 与环境文件
+
+如果 Compose 和 `.env` 由服务器管理员直接维护，可为单个应用环境配置独立目录，免去每次
+修改 Compose 后手动更新批准摘要。Git 仓库仍提供代码快照；Compose 入口文件及它通过
+`env_file` 引用的文件从管理员目录读取，不依赖 Git commit。一个环境只使用一个明确的
+Compose 入口，不自动猜测 `compose.yaml` 或 `docker-compose.yaml`。
+
+```yaml
+apps:
+  my-app:
+    git:
+      repo_path: /srv/projects/my-app
+      origin: https://example.invalid/my-app.git
+    environments:
+      staging:
+        project_name: drawbridge-my-app-staging
+        deployment_mode: docker
+        operator_compose:
+          directory: /etc/drawbridge/apps/my-app
+          file: compose.yaml
+```
+
+管理员目录必须位于 `allowed_project_roots`、Drawbridge 状态目录及发布目录之外；从根目录
+到实际文件的路径不得包含符号链接。目录、Compose 和环境文件须由管理员持有，且 Drawbridge
+的 Gateway/Runner 用户及其组不能写入。两进程必须能读取文件。首次配置后重启两进程，调用
+`ops_app_register`，其中 `compose_file` 使用同一个入口文件名。之后管理员修改文件内容不需
+改配置摘要、重启或重新注册；重新创建 plan 即可。服务名的增删和改名仍受固定服务集合约束。
+
+此模式允许 Compose 中的 `${VAR}` 从管理员目录的 `.env` 插值，也支持服务级相对路径
+`env_file`。引用文件必须是该目录内的普通文件；不支持动态插值的 `env_file` 路径、绝对路径、
+`include` 或 `extends`。这些文件也不能登记为 MCP 的 `editable_files`。计划自动记录内容摘要；文件在 plan 和 Runner 执行之间
+变化会使任务以 `STALE_PLAN` 失败。文件内容不返回给 MCP。Runner 从本地 Docker Engine
+解析预建镜像并用实际镜像 ID 启动，不执行构建或拉取；人工装载镜像可以在执行前完成。
+代码修改仍要先进入 Git commit。此模式尚未在真实服务器上验收。
+
 若连接返回 `401`，检查 token；`403` 检查客户端 CIDR、Host 和 Origin；`421` 检查
 MCP transport 的 Host 校验及端口转发；job 长时间停在 `queued` 时检查 Runner 的
 systemd 状态和日志。

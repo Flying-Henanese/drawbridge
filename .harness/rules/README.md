@@ -16,8 +16,9 @@
   固定工具参数和服务端校验表达。
 - 注册必须经过路径、Git、Compose 与构建 profile 校验。失败的注册不形成可 patch 的
   应用绑定；不能借运行时补丁绕过注册校验。
-- 发布计划必须从固定 Git SHA 的临时快照生成，并冻结显式 revision、服务集合、Compose、
-  build 声明、binding 配置、完整 build profile 和基线。Runner 用同一套原语重建快照并
+- 发布计划必须从固定 Git SHA 的临时源码快照生成；管理员维护模式还要复制管理员目录中
+  的 Compose 和被引用环境文件。计划冻结显式 revision、服务集合、Compose、管理员文件
+  内容摘要、build 声明、binding 配置、完整 build profile 和基线。Runner 用同一套原语重建快照并
   逐项复验；旧 schema 或任何不一致都必须在外部副作用前以 `STALE_PLAN` 终止。不能读取
   分支的新指向、未提交工作区或隐式 `current_revision` 来替代计划输入。
 - 构建通过管理员配置的 BuildKit socket 执行，Compose 更新使用受控 argv；不要回退到
