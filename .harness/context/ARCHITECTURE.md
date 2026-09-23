@@ -118,6 +118,13 @@ API；多语句状态转换在锁内使用短 `BEGIN IMMEDIATE` 事务。Gateway
 
 ## 当前实现与目标设计的差距
 
+- 管理员模式允许 `.env` 为 Compose 插值。当前 `docker compose up` 失败时，Runner 会把
+  Docker 错误输出经有限的字段脱敏写入 job 结果，`ops_release_status` 可能将其中的插值值
+  返回给 MCP 客户端；成功路径的响应扫描不能排除这一失败路径风险。本阶段的运维前提是
+  目标服务器位于内网且不暴露公网资源，操作人员本已能通过其他途径获取相关 token 和密码；
+  在此前提下暂时接受该风险。
+  在扩大网络或使用者范围前，应让客户端只收到固定错误信息，将详细诊断限制在服务端，
+  并增加包含环境变量标记值的失败路径回归测试。
 - `ops_release_rollback` 当前能完成 simulation release 的显式回滚；Docker release 的
   回滚会返回 `ROLLBACK_PRECHECK_FAILED`。部署失败后的自动回滚也尚未在当前执行流程中实现。
 - Docker Compose 更新一旦开始而失败，当前代码保留 release 制品供人工检查；不要把

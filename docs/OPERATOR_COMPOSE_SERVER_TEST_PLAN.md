@@ -13,7 +13,7 @@ staging 应用，不修改正在运行的业务应用。执行人逐步记录证
 | 管理员文件来源 | Compose、`.env`、服务级 `env_file` 来自管理员目录；代码来自指定 Git commit |
 | 免重复审批 | 改动管理员文件内容后，只需重新 plan；不改批准 SHA，不重启服务，不重新注册 |
 | 计划一致性 | 文件在 plan 与 Runner 执行之间变化，任务以 `STALE_PLAN` 失败，当前 release 不变 |
-| 环境变量 | `.env` 插值和服务级 `env_file` 均进入容器；MCP 响应和事件不返回文件内容 |
+| 环境变量 | `.env` 插值和服务级 `env_file` 均进入容器；本计划覆盖的 MCP 响应和事件不返回文件内容，Docker 异常失败路径的潜在泄露见[架构已知限制](../.harness/context/ARCHITECTURE.md) |
 | 镜像 | Runner 使用已装入本地 Docker Engine 的预建镜像 ID；不构建、不拉取 |
 | 权限 | Gateway/Runner 可读管理员文件，但不能写；`editable_files` 重叠由本地回归测试覆盖 |
 | 兼容 | Git Compose 的严格/摘要批准模式由本地 harness 回归测试覆盖；服务器检查固定服务集合约束 |

@@ -371,10 +371,14 @@ apps:
 
 此模式允许 Compose 中的 `${VAR}` 从管理员目录的 `.env` 插值，也支持服务级相对路径
 `env_file`。引用文件必须是该目录内的普通文件；不支持动态插值的 `env_file` 路径、绝对路径、
-`include` 或 `extends`。这些文件也不能登记为 MCP 的 `editable_files`。计划自动记录内容摘要；文件在 plan 和 Runner 执行之间
-变化会使任务以 `STALE_PLAN` 失败。文件内容不返回给 MCP。Runner 从本地 Docker Engine
-解析预建镜像并用实际镜像 ID 启动，不执行构建或拉取；人工装载镜像可以在执行前完成。
-代码修改仍要先进入 Git commit。此模式尚未在真实服务器上验收。
+`include` 或 `extends`。这些文件也不能登记为 MCP 的 `editable_files`。计划自动记录内容摘要；
+文件在 plan 和 Runner 执行之间变化会使任务以 `STALE_PLAN` 失败。本次 t4 测试的 MCP
+响应扫描未发现环境文件内容；部署失败的 Docker 错误输出仍可能包含 `.env` 插值值，见
+[架构中的已知限制](.harness/context/ARCHITECTURE.md)。Runner 从本地 Docker Engine 解析
+预建镜像并用实际镜像 ID 启动，不执行构建或拉取；人工装载镜像可以在执行前完成。
+代码修改仍要先进入 Git commit。此模式已在 t4 的独立 `operator-smoke` 应用完成核心验收，
+见[验证记录](docs/VERIFICATION_RECORD.md)；原始 ContractLens 应用尚未按管理员模式验收，
+BuildKit、回滚和中断恢复也不在此次验收范围内。
 
 若连接返回 `401`，检查 token；`403` 检查客户端 CIDR、Host 和 Origin；`421` 检查
 MCP transport 的 Host 校验及端口转发；job 长时间停在 `queued` 时检查 Runner 的

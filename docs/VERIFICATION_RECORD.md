@@ -570,3 +570,17 @@ ContractLens 业务应用。
 没有执行可选的入口文件名切换、权限/符号链接负例、GPU/NPU、BuildKit 构建、回滚或中断恢复；
 也不证明原始 ContractLens 应用已通过管理员模式验收。测试容器和 release 保留以供复盘，后续停用
 由管理员核对证据后决定。
+
+## 28. 管理员 Compose 文档边界修订（本地验证，2026-09-23）
+
+在 commit `8af61237ac22488051a64aef314299f24ad29406` 的工作树上修订文档：
+`.harness/context/ARCHITECTURE.md` 记录 Docker 部署失败时错误输出可能携带管理员 `.env`
+插值值的剩余风险、当前内网运维前提和扩大使用范围前的处理条件；README 与服务器验收计划
+同步限定响应扫描的覆盖范围，并把管理员模式的 t4 验收状态更新为第 27 节实际结论。
+未修改产品代码，也未在本次文档修订后重新执行服务器部署。
+
+本地 macOS arm64、Python 3.14.5 执行 `uv sync --frozen --extra dev` 和完整
+`.venv/bin/python scripts/verify.py`，报告为
+`var/verification/20260923T100117Z/report.json`，`result: passed`；Ruff、格式、mypy、
+编译、pytest、隔离 self-check 和 simulation 均通过。该本地结果不消除上述 Docker
+异常失败路径的潜在泄露，也不扩大第 27 节的真实服务器验收范围。
