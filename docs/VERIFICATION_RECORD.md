@@ -500,3 +500,73 @@ t4 证据仍是带日期的记录，不代表当前服务器就绪状态。
 失效、重新计划后发布、Compose 入口文件名刷新、受控目录、相对路径和 MCP 可编辑文件重叠限制，以及用受控执行器
 模拟的 Docker 镜像 ID 固定。此结果没有在 t4 上验收实际管理员目录权限、Docker Compose
 解析、本地镜像运行或业务健康；不代表真实服务器发布就绪。
+
+## 27. 管理员维护 Compose 模式 t4 独立应用验收（2026-09-23）
+
+2026-09-23 09:16 UTC 在 t4（hostname `bms-v38f-0004`）完成独立 smoke 应用验证。Drawbridge
+服务器工作树位于 `/home/mineru_dev/github_repo/drawbridge`，分支
+`codex/operator-managed-compose-validation`，commit
+`d1480293582c19fff76aa3350d315936537c92bc`。远端执行 `uv sync --frozen --extra dev` 和
+`.venv/bin/python scripts/verify.py`，报告为
+`/home/mineru_dev/github_repo/drawbridge/var/verification/20260923T074245Z/report.json`，
+`result: passed`，84 个 pytest 及其余 harness 步骤通过。Drawbridge 跟踪文件无改动；原有
+7 个未跟踪 `.pre-*` 备份保留。Gateway 和 Runner 均为 active、running，重启计数为 0。
+
+MCP `ops_catalog`、应用注册、首次发布以及 3A/3B 的计划从 t4 客户端发起。按外部客户端场景调整后，
+从 3B apply 的同幂等键重试开始，其余 MCP 工具调用由本机客户端直接请求
+`192.168.0.67:8787/mcp`，未使用 SSH 隧道。测试配置 SHA-256 为
+`cb5014e3be73e6aeeb74aca6657018daa60e508cc8e624e756cdf4e14cc04743`。Gateway 与 Runner 使用同一个
+`mineru_dev` user service 账号和配置；账号属于 `docker` 组。管理员目录为
+`/etc/drawbridge/apps/operator-smoke`，属主/属组为 `root:mineru_dev`，目录权限 `0750`，
+三个文件均为 `0640`；服务账号可读而不可直接写，路径中没有符号链接。该主机没有为 Gateway
+与 Runner 提供不同的 Unix 身份或独立的 Docker 最小权限边界，此项结果仅证明直接文件权限检查。
+
+测试源仓库为 `/data1/zsj/projects/drawbridge-operator-smoke/repo`，仅由 ContractLens 已提交文件
+形成独立 Git 仓库，`main` commit 为
+`9853fbe814565c284d112a85181c89ea810da312`，`origin` 与登记值一致。用户给出的原始
+`/home/mineru_dev/projects/ContractLens`（规范路径 `/data1/zsj/projects/ContractLens`）没有被修改；
+其分支仍为 `codex/unify-inference-stack`、HEAD 仍为
+`b82488da940db3eec58f3c08c14f12312d68ef08`，原有未跟踪备份保留。测试使用本地镜像
+`docker.m.daocloud.io/library/node:24.15.0-alpine`，镜像 ID 为
+`sha256:edd927012c1ea203e392a59f0ae655a9e50a67bf3a5cb42dc1c638889a03a3b0`。
+
+应用注册为 `operator-smoke/staging`，binding version 为 1，固定服务集合为 `app`。MCP 发布记录：
+
+- 首次发布：plan `e418d8b2-936e-4054-b48f-6e90d2f26776`，job
+  `c4531aa2-487d-4605-ae7b-88243327015e`，release
+  `003c658a-1b09-4dfd-9db1-0474d70e5f5b`；succeeded，`built_images` 为空。
+- 3A 管理员环境文件改为标记 `two` 后，无需改 SHA、配置、重启或重新注册即可重新 plan/apply：plan
+  `98db8c76-0453-4086-9bf0-9c80ddef5d8f`，job
+  `4dad20da-1434-4e9a-ac0e-b5de5e5e61f9`，release
+  `55492eef-1bd2-4afc-83fc-5ca1843a839b`；succeeded，两个标记检查退出码均为 0。
+- 3B 管理员 Compose 增加 revision label `two` 后，同样无需重新注册或批准新 SHA：plan
+  `f3cc4fde-8781-4915-8c5d-4d50e80daab3`，job
+  `55b98a59-bb84-49b3-a2f8-ced721ad61ee`，release
+  `2763bcf8-d86d-4ff8-ad24-53e87a2c40fc`；succeeded，label 在容器上可见。
+- 4.1 先为文件状态创建旧 plan `3af84901-87c9-4ffd-9215-45d7c1301ac3`，再只把
+  `runtime.env` 改为 `three`。旧 plan 对应 job
+  `8efbc2fe-193b-4f1a-8ab0-260513db53b6` 以 `STALE_PLAN` 失败，当前 release 仍为
+  `2763bcf8-d86d-4ff8-ad24-53e87a2c40fc`，原容器仍运行且原标记检查通过。新 plan
+  `9dab65ff-365e-4ae1-b5ee-eb4078a7d8d3`、job
+  `1e8ad813-bbaa-4aaa-83d6-7900c82ada19`、release
+  `d42b6c04-8495-4f8b-8661-4aed8328d4a7` 均成功；`INTERP_MARKER=two` 和
+  `FILE_MARKER=three` 的只返回退出码检查均为 0，容器 running，revision label 仍为 `two`。
+- 4.2 在隔离仓库 `README.md` 追加未提交探针时创建 plan
+  `8f0b8f1f-dd9e-4ae1-9bea-087ca00a0f40`；返回 SHA 仍为原 `main` commit，工作区探针不在该
+  commit 的 `git archive` 中。探针随后被精确移除，隔离仓库工作树恢复干净；没有 apply。
+- 4.3 临时添加第二个 Compose 服务时，plan 按预期返回
+  `UNSUPPORTED_SERVICE_CHANGE`，没有生成可执行 plan，也没有 apply。恢复单服务文件后，新 plan
+  `ac5e5352-c353-485a-a195-2e540a87634b` 成功，services 仍为 `app`，Compose digest 恢复为
+  `ec1f1caba5cd5696b491c3f7010c69dc8524236666258279dc3cf79309199618`。
+
+所有成功发布均使用相同本地镜像 ID，`built_images` 为空，健康检查为 `runtime_only/passed`；
+受检 Runner 日志中没有 BuildKit、镜像导入或拉取步骤。MCP 响应扫描未发现 `.env` 或
+`runtime.env` 文件内容。最终 `ops_status` 仍指向 release
+`d42b6c04-8495-4f8b-8661-4aed8328d4a7`，容器保持运行在隔离项目
+`drawbridge-operator-smoke-staging` 中；没有对该项目执行 down/prune，也没有切换或重启
+ContractLens 业务应用。
+
+本结果仅支持结论“t4 上的独立 `operator-smoke` 应用通过本计划的管理员维护 Compose 核心验收”。
+没有执行可选的入口文件名切换、权限/符号链接负例、GPU/NPU、BuildKit 构建、回滚或中断恢复；
+也不证明原始 ContractLens 应用已通过管理员模式验收。测试容器和 release 保留以供复盘，后续停用
+由管理员核对证据后决定。
